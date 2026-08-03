@@ -98,7 +98,7 @@ function todayStr() {
 
 /* ---------- Volume calculations ---------- */
 function exerciseVolume(exercise) {
-  return exercise.sets.reduce((sum, s) => sum + (Number(s.weight) || 0) * (Number(s.reps) || 0), 0);
+  return setsToVolume(exercise.sets);
 }
 
 function sessionVolume(session) {
@@ -980,7 +980,72 @@ importFileInput.addEventListener('change', (e) => {
 /* ---------- CHARTS VIEW ---------- */
 const chartExerciseSelect = document.getElementById('chartExerciseSelect');
 const chartArea = document.getElementById('chartArea');
-let chartInstance = null;
+let chartInstances = [];
+
+const CHART_METRICS = {
+  volume: {
+    label: 'Volume Load',
+    shortLabel: 'Vol',
+    compute: setsToVolume,
+    format: fmtNum,
+  },
+  avgWeight: {
+    label: 'Average Weight',
+    shortLabel: 'Avg Wt',
+    compute: setsToAvgWeight,
+    format: n => (Math.round(n * 10) / 10).toLocaleString(),
+  },
+  maxWeight: {
+    label: 'Max Weight',
+    shortLabel: 'Max Wt',
+    compute: sets => sets.reduce((m, s) => Math.max(m, Number(s.weight) || 0), 0),
+    format: fmtNum,
+  },
+  maxReps: {
+    label: 'Max Reps',
+    shortLabel: 'Max Reps',
+    compute: sets => sets.reduce((m, s) => Math.max(m, Number(s.reps) || 0), 0),
+    format: n => Math.round(n).toLocaleString(),
+  },
+};
+
+function setsToVolume(sets) {
+  return sets.reduce((sum, s) => sum + (Number(s.weight) || 0) * (Number(s.reps) || 0), 0);
+}
+
+// Weighted average weight per rep: ((w1*r1) + (w2*r2) + ...) / (r1 + r2 + ...)
+function setsToAvgWeight(sets) {
+  const totalReps = sets.reduce((sum, s) => sum + (Number(s.reps) || 0), 0);
+  if (totalReps === 0) return 0;
+  return setsToVolume(sets) / totalReps;
+}
+
+// All sets logged for a given exercise (matched by library id when linked), grouped
+// by date so multiple sessions of the same exercise on the same day combine correctly.
+function setsByDateFor(targetKey) {
+  const byDate = new Map();
+  sessions.forEach(s => {
+    s.exercises.forEach(ex => {
+      if (exerciseMatchKey(ex) === targetKey) {
+        if (!byDate.has(s.date)) byDate.set(s.date, []);
+        byDate.get(s.date).push(...ex.sets);
+      }
+    });
+  });
+  return byDate;
+}
+
+// Chart y-axis min/max: start a bit below the lowest value instead of always at 0.
+function computeAxisRange(values) {
+  const dataMin = Math.min(...values);
+  const dataMax = Math.max(...values);
+  const range = dataMax - dataMin;
+  const margin = range > 0 ? range * 0.1 : Math.max(1, dataMax * 0.1 || 1);
+  return {
+    min: Math.max(0, Math.floor(dataMin - margin)),
+    max: Math.ceil(dataMax + margin),
+  };
+}
 
 function renderCharts() {
   const names = allExerciseNames(sessions);
@@ -999,10 +1064,10 @@ function renderCharts() {
   chartExerciseSelect.innerHTML = names.map(n => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join('');
   if (names.includes(prevSelected)) chartExerciseSelect.value = prevSelected;
 
-  drawChartFor(chartExerciseSelect.value);
+  drawChartsFor(chartExerciseSelect.value);
 }
 
-chartExerciseSelect.addEventListener('change', () => drawChartFor(chartExerciseSelect.value));
+chartExerciseSelect.addEventListener('change', () => drawChartsFor(chartExerciseSelect.value));
 
 // If Chart.js was still loading (or a CDN attempt failed and a fallback kicked in) when
 // the user first opened this tab, redraw automatically the moment it becomes available.
@@ -1010,71 +1075,82 @@ window.addEventListener('chartjs-ready', () => {
   if (currentView === 'charts') renderCharts();
 });
 
-function drawChartFor(exerciseName) {
+// Renders all four metrics (Volume Load, Average Weight, Max Weight, Max Reps) at once,
+// each as its own compact chart card with its own independently-scaled y-axis.
+function drawChartsFor(exerciseName) {
+  chartInstances.forEach(c => c.destroy());
+  chartInstances = [];
+
   if (!exerciseName) return;
   const targetKey = matchKeyForName(exerciseName);
 
-  // Aggregate volume by date for this exercise (matched by library ID when linked,
-  // so a rename doesn't split the trend line into two separate exercises)
-  const byDate = new Map();
-  sessions.forEach(s => {
-    s.exercises.forEach(ex => {
-      if (exerciseMatchKey(ex) === targetKey) {
-        const v = exerciseVolume(ex);
-        byDate.set(s.date, (byDate.get(s.date) || 0) + v);
-      }
-    });
-  });
+  const byDate = setsByDateFor(targetKey);
+  const dates = [...byDate.keys()].sort((a, b) => a.localeCompare(b));
 
-  const points = [...byDate.entries()].sort((a, b) => a[0].localeCompare(b[0]));
-
-  chartArea.innerHTML = `
-    <div class="chart-wrap"><canvas id="volChart"></canvas></div>
-    <div class="stat-row">
-      <div class="stat-box"><div class="label">Sessions</div><div class="value" id="statSessions">-</div></div>
-      <div class="stat-box"><div class="label">Latest Vol</div><div class="value" id="statLatest">-</div></div>
-      <div class="stat-box"><div class="label">Peak Vol</div><div class="value" id="statPeak">-</div></div>
-    </div>
-  `;
-
-  if (points.length === 0) return;
-
-  document.getElementById('statSessions').textContent = points.length;
-  document.getElementById('statLatest').textContent = fmtNum(points[points.length - 1][1]);
-  document.getElementById('statPeak').textContent = fmtNum(Math.max(...points.map(p => p[1])));
-
-  const ctx = document.getElementById('volChart').getContext('2d');
-  if (chartInstance) chartInstance.destroy();
-
-  if (typeof Chart === 'undefined') {
-    chartArea.querySelector('.chart-wrap').innerHTML = `<div class="empty-state">Chart library unavailable offline on first load. Open once with internet, then it's cached for offline use.</div>`;
+  if (dates.length === 0) {
+    chartArea.innerHTML = `<div class="empty-state">No logged sets yet for this exercise.</div>`;
     return;
   }
 
-  chartInstance = new Chart(ctx, {
-    type: 'line',
-    data: {
-      labels: points.map(p => fmtDate(p[0])),
-      datasets: [{
-        label: exerciseName,
-        data: points.map(p => p[1]),
-        borderColor: '#5b8cff',
-        backgroundColor: 'rgba(91,140,255,0.15)',
-        pointBackgroundColor: '#5b8cff',
-        pointRadius: 4,
-        tension: 0.25,
-        fill: true,
-      }],
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: { legend: { display: false } },
-      scales: {
-        x: { ticks: { color: '#9aa2b1', maxRotation: 0, autoSkip: true }, grid: { color: '#2a2f3a' } },
-        y: { ticks: { color: '#9aa2b1' }, grid: { color: '#2a2f3a' }, beginAtZero: true },
+  const metricKeys = Object.keys(CHART_METRICS);
+
+  chartArea.innerHTML = `
+    <div class="chart-session-count">${dates.length} session${dates.length !== 1 ? 's' : ''} logged</div>
+    ${metricKeys.map(key => `
+      <div class="chart-card">
+        <div class="chart-card-head">
+          <div class="chart-card-title">${CHART_METRICS[key].label}</div>
+          <div class="chart-card-stats">Latest <strong id="latest-${key}">-</strong> &middot; Peak <strong id="peak-${key}">-</strong></div>
+        </div>
+        <div class="chart-wrap-sm"><canvas id="chart-${key}"></canvas></div>
+      </div>
+    `).join('')}
+  `;
+
+  const chartJsAvailable = typeof Chart !== 'undefined';
+  if (!chartJsAvailable) {
+    chartArea.insertAdjacentHTML('beforeend', `<div class="empty-state">Chart library unavailable offline on first load. Open once with internet, then it's cached for offline use.</div>`);
+  }
+
+  metricKeys.forEach(key => {
+    const metric = CHART_METRICS[key];
+    const points = dates.map(d => [d, metric.compute(byDate.get(d))]);
+    const values = points.map(p => p[1]);
+
+    document.getElementById(`latest-${key}`).textContent = metric.format(values[values.length - 1]);
+    document.getElementById(`peak-${key}`).textContent = metric.format(Math.max(...values));
+
+    if (!chartJsAvailable) return;
+
+    const axisRange = computeAxisRange(values);
+    const ctx = document.getElementById(`chart-${key}`).getContext('2d');
+
+    const inst = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: points.map(p => fmtDate(p[0])),
+        datasets: [{
+          label: `${exerciseName} — ${metric.label}`,
+          data: values,
+          borderColor: '#5b8cff',
+          backgroundColor: 'rgba(91,140,255,0.15)',
+          pointBackgroundColor: '#5b8cff',
+          pointRadius: 3,
+          tension: 0.25,
+          fill: true,
+        }],
       },
-    },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { ticks: { color: '#9aa2b1', maxRotation: 0, autoSkip: true, font: { size: 10 } }, grid: { color: '#2a2f3a' } },
+          y: { ticks: { color: '#9aa2b1', font: { size: 10 } }, grid: { color: '#2a2f3a' }, min: axisRange.min, max: axisRange.max },
+        },
+      },
+    });
+    chartInstances.push(inst);
   });
 }
 
