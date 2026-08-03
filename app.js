@@ -863,6 +863,120 @@ function renderHistory() {
   });
 }
 
+/* ---------- Backup / Export / Import ---------- */
+function buildBackupPayload() {
+  return {
+    format: 'workout-tracker-backup',
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    sessions,
+    routines,
+    exerciseLibrary,
+  };
+}
+
+function csvEscape(val) {
+  const str = String(val == null ? '' : val);
+  return /[",\n]/.test(str) ? '"' + str.replace(/"/g, '""') + '"' : str;
+}
+
+function buildCsv() {
+  const rows = [['Date', 'Routine', 'Exercise', 'Set', 'Weight', 'Reps', 'Volume', 'Notes']];
+  const sorted = [...sessions].sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id));
+  sorted.forEach(s => {
+    const routineName = displayRoutineName(s) || '';
+    s.exercises.forEach(ex => {
+      const exName = displayExerciseName(ex);
+      ex.sets.forEach((set, i) => {
+        rows.push([
+          s.date,
+          routineName,
+          exName,
+          i + 1,
+          set.weight,
+          set.reps,
+          (Number(set.weight) || 0) * (Number(set.reps) || 0),
+          ex.notes || '',
+        ]);
+      });
+    });
+  });
+  return rows.map(r => r.map(csvEscape).join(',')).join('\r\n');
+}
+
+function triggerDownload(filename, content, mimeType) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+document.getElementById('exportJsonBtn').addEventListener('click', () => {
+  triggerDownload(`workout-backup-${todayStr()}.json`, JSON.stringify(buildBackupPayload(), null, 2), 'application/json');
+  showToast('Backup downloaded');
+});
+
+document.getElementById('exportCsvBtn').addEventListener('click', () => {
+  triggerDownload(`workout-data-${todayStr()}.csv`, buildCsv(), 'text/csv');
+  showToast('CSV downloaded');
+});
+
+// Merge an imported backup into current data. Never deletes or overwrites anything
+// that's already there — only adds records whose id isn't already present. Returns
+// counts of what was actually added, or throws if the file doesn't look like a backup.
+function applyImportedBackup(data) {
+  if (!data || !Array.isArray(data.sessions) || !Array.isArray(data.routines) || !Array.isArray(data.exerciseLibrary)) {
+    throw new Error('Not a valid workout tracker backup file');
+  }
+
+  const existingSessionIds = new Set(sessions.map(s => s.id));
+  const newSessions = data.sessions.filter(s => s && s.id && !existingSessionIds.has(s.id));
+  sessions = sessions.concat(newSessions);
+
+  const existingRoutineIds = new Set(routines.map(r => r.id));
+  const newRoutines = data.routines.map(normalizeRoutine).filter(r => r && r.id && !existingRoutineIds.has(r.id));
+  routines = routines.concat(newRoutines);
+
+  const existingLibIds = new Set(exerciseLibrary.map(e => e.id));
+  const newLibEntries = normalizeExerciseLibrary(data.exerciseLibrary).filter(e => e && e.id && !existingLibIds.has(e.id));
+  exerciseLibrary = exerciseLibrary.concat(newLibEntries);
+
+  saveSessions(sessions);
+  saveRoutines(routines);
+  saveExerciseLibrary(exerciseLibrary);
+
+  return { sessions: newSessions.length, routines: newRoutines.length, exercises: newLibEntries.length };
+}
+
+const importFileInput = document.getElementById('importFileInput');
+document.getElementById('importJsonBtn').addEventListener('click', () => importFileInput.click());
+importFileInput.addEventListener('change', (e) => {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const data = JSON.parse(reader.result);
+      const added = applyImportedBackup(data);
+      refreshExerciseDatalist();
+      populateRoutineSelect();
+      renderHistory();
+      showToast(`Restored ${added.sessions} workout${added.sessions !== 1 ? 's' : ''}, ${added.routines} routine${added.routines !== 1 ? 's' : ''}, ${added.exercises} exercise${added.exercises !== 1 ? 's' : ''}`);
+    } catch (err) {
+      console.error(err);
+      showToast("Couldn't read that file — is it a workout tracker backup?");
+    } finally {
+      importFileInput.value = '';
+    }
+  };
+  reader.readAsText(file);
+});
+
 /* ---------- CHARTS VIEW ---------- */
 const chartExerciseSelect = document.getElementById('chartExerciseSelect');
 const chartArea = document.getElementById('chartArea');

@@ -509,6 +509,15 @@
 
     <!-- HISTORY VIEW -->
     <section id="view-history" class="view">
+      <div class="card">
+        <label>Backup &amp; Export</label>
+        <div class="row" style="margin-top:8px;">
+          <button class="btn btn-secondary btn-sm" id="exportJsonBtn">Download Backup (JSON)</button>
+          <button class="btn btn-secondary btn-sm" id="exportCsvBtn">Download CSV</button>
+        </div>
+        <button class="btn btn-secondary btn-sm btn-block" id="importJsonBtn" style="margin-top:8px;">Restore from Backup</button>
+        <input type="file" id="importFileInput" accept="application/json,.json" style="display:none;">
+      </div>
       <div id="historyList"></div>
     </section>
 
