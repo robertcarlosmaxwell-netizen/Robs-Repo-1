@@ -1,7 +1,7 @@
 // Bump this version string any time index.html/app.js/manifest.json/icons change.
 // The browser re-installs the service worker whenever this file's bytes change, which
 // is what actually pushes updated app files out to people who already installed the app.
-const CACHE_NAME = 'workout-tracker-v3';
+const CACHE_NAME = 'workout-tracker-v4';
 const ASSETS = [
   './',
   './index.html',

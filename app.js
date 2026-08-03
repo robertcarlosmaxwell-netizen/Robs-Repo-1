@@ -66,16 +66,23 @@ function saveExerciseLibrary(list) {
   localStorage.setItem(EXERCISE_LIBRARY_KEY, JSON.stringify(list));
 }
 
-// Normalize routines to { id, name, exercises: [{ name, sets }] }.
+// Normalize routines to { id, name, exercises: [{ name, sets, exerciseId }] }.
 // Older saved routines stored exercises as plain strings — upgrade them in place.
 function normalizeRoutine(r) {
   return {
     id: r.id,
     name: r.name,
     exercises: (r.exercises || []).map(e =>
-      typeof e === 'string' ? { name: e, sets: 3 } : { name: e.name, sets: Number(e.sets) || 3 }
+      typeof e === 'string'
+        ? { name: e, sets: 3, exerciseId: null }
+        : { name: e.name, sets: Number(e.sets) || 3, exerciseId: e.exerciseId || null }
     ),
   };
+}
+
+// Older saved libraries stored exercises as plain strings — give them stable IDs.
+function normalizeExerciseLibrary(list) {
+  return (list || []).map(e => (typeof e === 'string' ? { id: uid(), name: e } : e));
 }
 
 function uid() {
@@ -98,13 +105,50 @@ function sessionVolume(session) {
   return session.exercises.reduce((sum, ex) => sum + exerciseVolume(ex), 0);
 }
 
+/* ---------- Exercise identity (library IDs) ---------- */
+// These helpers are the single source of truth for "is this the same exercise",
+// so that renaming a library exercise correctly relabels it everywhere it's linked,
+// while exercises that were never added to the library (declined the save prompt)
+// keep working via plain name matching like before.
+function findExerciseById(id) {
+  return exerciseLibrary.find(e => e.id === id) || null;
+}
+
+function findExerciseByName(name) {
+  const key = (name || '').trim().toLowerCase();
+  if (!key) return null;
+  return exerciseLibrary.find(e => e.name.trim().toLowerCase() === key) || null;
+}
+
+// What to actually display for a logged/routine exercise entry: the *current*
+// library name if it's linked (so a rename propagates), else the name captured
+// at the time it was logged.
+function displayExerciseName(entry) {
+  if (entry.exerciseId) {
+    const lib = findExerciseById(entry.exerciseId);
+    if (lib) return lib.name;
+  }
+  return entry.name;
+}
+
+function exerciseMatchKey(entry) {
+  return entry.exerciseId ? 'id:' + entry.exerciseId : 'name:' + entry.name.trim().toLowerCase();
+}
+
+// Resolve a typed/selected exercise name to the same key an already-linked entry
+// would have, by checking whether it currently matches a library exercise.
+function matchKeyForName(name) {
+  const lib = findExerciseByName(name);
+  return lib ? 'id:' + lib.id : 'name:' + (name || '').trim().toLowerCase();
+}
+
 function allExerciseNames(sessions) {
-  const seen = new Map(); // lowercase -> display name (most recent casing)
+  const seen = new Map(); // matchKey -> display name (resolved live for linked entries)
   const sorted = [...sessions].sort((a, b) => a.date.localeCompare(b.date));
   sorted.forEach(s => {
     s.exercises.forEach(ex => {
-      const key = ex.name.trim().toLowerCase();
-      if (key) seen.set(key, ex.name.trim());
+      const display = displayExerciseName(ex).trim();
+      if (display) seen.set(exerciseMatchKey(ex), display);
     });
   });
   return [...seen.values()].sort((a, b) => a.localeCompare(b));
@@ -115,8 +159,8 @@ function allExerciseNames(sessions) {
 // for display casing since that's now the canonical source).
 function knownExerciseNames() {
   const seen = new Map();
-  exerciseLibrary.forEach(n => {
-    const trimmed = (n || '').trim();
+  exerciseLibrary.forEach(e => {
+    const trimmed = (e.name || '').trim();
     if (trimmed) seen.set(trimmed.toLowerCase(), trimmed);
   });
   allExerciseNames(sessions).forEach(n => {
@@ -126,31 +170,46 @@ function knownExerciseNames() {
   return [...seen.values()].sort((a, b) => a.localeCompare(b));
 }
 
-// If any of the given exercise names aren't in the library yet, ask once (single
-// dialog covering all of them) whether to add them for future autocomplete.
+// Resolves every given exercise name to a library exerciseId, prompting once (a
+// single dialog covering everything new) to add any that aren't in the library yet.
+// Returns a Map of lowercase-name -> exerciseId for every name that ended up linked
+// (pre-existing matches AND newly-created ones), so callers can stamp exerciseId
+// onto the records they're about to save.
 function promptAddNewExercises(names) {
-  const known = new Set(exerciseLibrary.map(n => n.trim().toLowerCase()));
+  const linked = new Map();
   const newOnes = [];
   const seenThisCall = new Set();
+
   (names || []).forEach(n => {
     const trimmed = (n || '').trim();
+    if (!trimmed) return;
     const key = trimmed.toLowerCase();
-    if (trimmed && !known.has(key) && !seenThisCall.has(key)) {
+    const existing = findExerciseByName(trimmed);
+    if (existing) {
+      linked.set(key, existing.id);
+    } else if (!seenThisCall.has(key)) {
       newOnes.push(trimmed);
       seenThisCall.add(key);
     }
   });
-  if (newOnes.length === 0) return;
 
-  const msg = newOnes.length === 1
-    ? `Add "${newOnes[0]}" to your exercise library for future autocomplete?`
-    : `Add these new exercises to your library for future autocomplete?\n\n${newOnes.map(n => '• ' + n).join('\n')}`;
+  if (newOnes.length > 0) {
+    const msg = newOnes.length === 1
+      ? `Add "${newOnes[0]}" to your exercise library for future autocomplete?`
+      : `Add these new exercises to your library for future autocomplete?\n\n${newOnes.map(n => '• ' + n).join('\n')}`;
 
-  if (confirm(msg)) {
-    exerciseLibrary = exerciseLibrary.concat(newOnes);
-    saveExerciseLibrary(exerciseLibrary);
-    refreshExerciseDatalist();
+    if (confirm(msg)) {
+      newOnes.forEach(n => {
+        const entry = { id: uid(), name: n };
+        exerciseLibrary.push(entry);
+        linked.set(n.toLowerCase(), entry.id);
+      });
+      saveExerciseLibrary(exerciseLibrary);
+      refreshExerciseDatalist();
+    }
   }
+
+  return linked;
 }
 
 function fmtNum(n) {
@@ -178,23 +237,25 @@ function formatDuration(totalSeconds) {
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
 }
 
-/* Most recent past session containing this exercise (case-insensitive match) */
+/* Most recent past session containing this exercise (matched by library ID when
+   linked, so renaming an exercise doesn't disconnect it from its own history;
+   falls back to a case-insensitive name match for never-linked exercises). */
 function lastPerformanceFor(name) {
-  const key = (name || '').trim().toLowerCase();
-  if (!key) return null;
+  if (!(name || '').trim()) return null;
+  const targetKey = matchKeyForName(name);
   const matches = sessions
-    .filter(s => s.exercises.some(ex => ex.name.trim().toLowerCase() === key))
+    .filter(s => s.exercises.some(ex => exerciseMatchKey(ex) === targetKey))
     .sort((a, b) => b.date.localeCompare(a.date) || b.id.localeCompare(a.id));
   if (matches.length === 0) return null;
   const session = matches[0];
-  const ex = session.exercises.find(e => e.name.trim().toLowerCase() === key);
+  const ex = session.exercises.find(e => exerciseMatchKey(e) === targetKey);
   return { date: session.date, sets: ex.sets, volume: exerciseVolume(ex) };
 }
 
 /* ---------- App state ---------- */
 let sessions = loadSessions();
 let routines = loadRoutines().map(normalizeRoutine);
-let exerciseLibrary = loadExerciseLibrary();
+let exerciseLibrary = normalizeExerciseLibrary(loadExerciseLibrary());
 let currentView = 'log';
 let openSessionIds = new Set();
 let draftRoutine = null; // { id: string|null, name: string, exercises: [{name, sets}] }
@@ -492,18 +553,23 @@ endWorkoutBtn.addEventListener('click', () => {
     .filter(ex => ex.name && ex.sets.length > 0);
 
   if (cleanExercises.length > 0) {
+    const linked = promptAddNewExercises(cleanExercises.map(ex => ex.name));
+    cleanExercises.forEach(ex => {
+      ex.exerciseId = linked.get(ex.name.toLowerCase()) || null;
+    });
+
     sessions.push({
       id: uid(),
       date: activeWorkout.date,
       exercises: cleanExercises,
       durationSeconds,
+      routineId: activeWorkout.routineId || null,
       routineName: activeWorkout.routineName || null,
       startedAt: new Date(activeWorkout.startTime).toISOString(),
       endedAt: new Date().toISOString(),
     });
     saveSessions(sessions);
     refreshExerciseDatalist();
-    promptAddNewExercises(cleanExercises.map(ex => ex.name));
     showToast(`Workout saved ✓ (${formatDuration(durationSeconds)})`);
   } else {
     showToast('Workout ended — no sets logged, nothing saved');
@@ -546,7 +612,7 @@ function renderRoutineList() {
         </div>
       </div>
       <div class="session-body open">
-        <div class="ex-row"><div class="sets">${r.exercises.map(e => `${escapeHtml(e.name)} (${e.sets})`).join(' · ')}</div></div>
+        <div class="ex-row"><div class="sets">${r.exercises.map(e => `${escapeHtml(displayExerciseName(e))} (${e.sets})`).join(' · ')}</div></div>
         <div class="session-actions" style="justify-content:space-between;">
           <button class="btn btn-secondary btn-sm" data-role="edit">Edit</button>
           <button class="btn btn-danger btn-sm" data-role="delete">Delete</button>
@@ -569,7 +635,7 @@ function renderRoutineList() {
 function openRoutineEditor(routine) {
   draftRoutine = routine
     ? { id: routine.id, name: routine.name, exercises: routine.exercises.map(e => ({ ...e })) }
-    : { id: null, name: '', exercises: [{ name: '', sets: '' }] };
+    : { id: null, name: '', exercises: [{ name: '', sets: '', exerciseId: null }] };
   routineNameInput.value = draftRoutine.name;
   renderRoutineExerciseInputs();
   routineEditorEl.style.display = 'block';
@@ -602,7 +668,7 @@ function renderRoutineExerciseInputs() {
     });
     row.querySelector('[data-role="remove-rex"]').addEventListener('click', () => {
       draftRoutine.exercises.splice(i, 1);
-      if (draftRoutine.exercises.length === 0) draftRoutine.exercises.push({ name: '', sets: '' });
+      if (draftRoutine.exercises.length === 0) draftRoutine.exercises.push({ name: '', sets: '', exerciseId: null });
       renderRoutineExerciseInputs();
     });
     routineExerciseListEl.appendChild(row);
@@ -612,7 +678,7 @@ function renderRoutineExerciseInputs() {
 document.getElementById('newRoutineBtn').addEventListener('click', () => openRoutineEditor(null));
 
 document.getElementById('addRoutineExerciseBtn').addEventListener('click', () => {
-  draftRoutine.exercises.push({ name: '', sets: '' });
+  draftRoutine.exercises.push({ name: '', sets: '', exerciseId: null });
   renderRoutineExerciseInputs();
 });
 
@@ -632,7 +698,8 @@ document.getElementById('saveRoutineBtn').addEventListener('click', () => {
   if (!name) { showToast('Give the routine a name'); return; }
   if (exs.length === 0) { showToast('Add at least one exercise'); return; }
 
-  promptAddNewExercises(exs.map(e => e.name));
+  const linked = promptAddNewExercises(exs.map(e => e.name));
+  exs.forEach(e => { e.exerciseId = linked.get(e.name.toLowerCase()) || null; });
 
   if (draftRoutine.id) {
     const r = routines.find(x => x.id === draftRoutine.id);
@@ -653,7 +720,7 @@ const exerciseLibraryListEl = document.getElementById('exerciseLibraryList');
 const newExerciseInput = document.getElementById('newExerciseInput');
 
 function renderExerciseLibrary() {
-  const sorted = [...exerciseLibrary].sort((a, b) => a.localeCompare(b));
+  const sorted = [...exerciseLibrary].sort((a, b) => a.name.localeCompare(b.name));
 
   if (sorted.length === 0) {
     exerciseLibraryListEl.innerHTML = `
@@ -665,18 +732,36 @@ function renderExerciseLibrary() {
   }
 
   exerciseLibraryListEl.innerHTML = '';
-  sorted.forEach(name => {
+  sorted.forEach(entry => {
     const row = document.createElement('div');
     row.className = 'session-card';
     row.innerHTML = `
       <div class="session-head" style="cursor:default;">
-        <div class="date" style="font-size:15px;">${escapeHtml(name)}</div>
-        <button class="btn btn-danger btn-sm" data-role="delete-ex">Delete</button>
+        <div class="date" style="font-size:15px;">${escapeHtml(entry.name)}</div>
+        <div class="row" style="flex:0 0 auto; gap:8px;">
+          <button class="btn btn-secondary btn-sm" data-role="rename-ex">Rename</button>
+          <button class="btn btn-danger btn-sm" data-role="delete-ex">Delete</button>
+        </div>
       </div>
     `;
+    row.querySelector('[data-role="rename-ex"]').addEventListener('click', () => {
+      const input = prompt('Rename exercise:', entry.name);
+      if (input === null) return; // cancelled
+      const trimmed = input.trim();
+      if (!trimmed) { showToast('Name cannot be empty'); return; }
+      if (exerciseLibrary.some(e => e.id !== entry.id && e.name.toLowerCase() === trimmed.toLowerCase())) {
+        showToast('Another exercise already has that name');
+        return;
+      }
+      entry.name = trimmed;
+      saveExerciseLibrary(exerciseLibrary);
+      renderExerciseLibrary();
+      refreshExerciseDatalist();
+      showToast('Renamed ✓ — updated everywhere it\'s linked');
+    });
     row.querySelector('[data-role="delete-ex"]').addEventListener('click', () => {
-      if (confirm(`Remove "${name}" from your exercise library? Past logged workouts aren't affected.`)) {
-        exerciseLibrary = exerciseLibrary.filter(n => n.toLowerCase() !== name.toLowerCase());
+      if (confirm(`Remove "${entry.name}" from your exercise library? Anything already logged keeps showing this name, it just won't auto-update anymore.`)) {
+        exerciseLibrary = exerciseLibrary.filter(e => e.id !== entry.id);
         saveExerciseLibrary(exerciseLibrary);
         renderExerciseLibrary();
         refreshExerciseDatalist();
@@ -689,13 +774,12 @@ function renderExerciseLibrary() {
 document.getElementById('addLibraryExerciseBtn').addEventListener('click', () => {
   const name = newExerciseInput.value.trim();
   if (!name) { showToast('Type an exercise name first'); return; }
-  const key = name.toLowerCase();
-  if (exerciseLibrary.some(n => n.toLowerCase() === key)) {
+  if (findExerciseByName(name)) {
     showToast('Already in your library');
     newExerciseInput.value = '';
     return;
   }
-  exerciseLibrary.push(name);
+  exerciseLibrary.push({ id: uid(), name });
   saveExerciseLibrary(exerciseLibrary);
   newExerciseInput.value = '';
   renderExerciseLibrary();
@@ -705,6 +789,17 @@ document.getElementById('addLibraryExerciseBtn').addEventListener('click', () =>
 
 /* ---------- HISTORY VIEW ---------- */
 const historyListEl = document.getElementById('historyList');
+
+// Like displayExerciseName, but for the routine a session was started from —
+// resolves to the routine's current name if it still exists, else the name
+// captured when the workout was started.
+function displayRoutineName(session) {
+  if (session.routineId) {
+    const r = routines.find(x => x.id === session.routineId);
+    if (r) return r.name;
+  }
+  return session.routineName || null;
+}
 
 function renderHistory() {
   const sorted = [...sessions].sort((a, b) => b.date.localeCompare(a.date) || b.id.localeCompare(a.id));
@@ -724,19 +819,20 @@ function renderHistory() {
     const card = document.createElement('div');
     card.className = 'session-card';
     const isOpen = openSessionIds.has(session.id);
+    const rName = displayRoutineName(session);
 
     card.innerHTML = `
       <div class="session-head" data-role="head">
         <div>
           <div class="date">${fmtDate(session.date)}</div>
-          <div class="meta">${session.routineName ? escapeHtml(session.routineName) + ' · ' : ''}${session.exercises.length} exercise${session.exercises.length !== 1 ? 's' : ''}${session.durationSeconds != null ? ' · ' + formatDuration(session.durationSeconds) : ''}</div>
+          <div class="meta">${rName ? escapeHtml(rName) + ' · ' : ''}${session.exercises.length} exercise${session.exercises.length !== 1 ? 's' : ''}${session.durationSeconds != null ? ' · ' + formatDuration(session.durationSeconds) : ''}</div>
         </div>
         <div class="vol">${fmtNum(vol)}<div class="meta">total vol</div></div>
       </div>
       <div class="session-body ${isOpen ? 'open' : ''}" data-role="body">
         ${session.exercises.map(ex => `
           <div class="ex-row">
-            <div class="ex-name"><span>${escapeHtml(ex.name)}</span><span class="vol">${fmtNum(exerciseVolume(ex))} vol</span></div>
+            <div class="ex-name"><span>${escapeHtml(displayExerciseName(ex))}</span><span class="vol">${fmtNum(exerciseVolume(ex))} vol</span></div>
             <div class="sets">${ex.sets.map(s => `${s.weight}×${s.reps}`).join('  ·  ')}</div>
             ${ex.notes ? `<div class="ex-notes">📝 ${escapeHtml(ex.notes)}</div>` : ''}
           </div>
@@ -802,13 +898,14 @@ window.addEventListener('chartjs-ready', () => {
 
 function drawChartFor(exerciseName) {
   if (!exerciseName) return;
-  const key = exerciseName.trim().toLowerCase();
+  const targetKey = matchKeyForName(exerciseName);
 
-  // Aggregate volume by date for this exercise (case-insensitive match)
+  // Aggregate volume by date for this exercise (matched by library ID when linked,
+  // so a rename doesn't split the trend line into two separate exercises)
   const byDate = new Map();
   sessions.forEach(s => {
     s.exercises.forEach(ex => {
-      if (ex.name.trim().toLowerCase() === key) {
+      if (exerciseMatchKey(ex) === targetKey) {
         const v = exerciseVolume(ex);
         byDate.set(s.date, (byDate.get(s.date) || 0) + v);
       }
