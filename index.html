@@ -384,6 +384,28 @@
     text-align:center;
   }
 
+  /* Exercise name autocomplete dropdown (custom-built — iOS Safari's native
+     <datalist> suggestions are unreliable, so this drives its own list instead) */
+  .autocomplete-box{
+    position:fixed;
+    z-index:200;
+    display:none;
+    background:var(--bg-elev-2);
+    border:1px solid var(--border);
+    border-radius:10px;
+    max-height:190px;
+    overflow-y:auto;
+    box-shadow:0 8px 24px rgba(0,0,0,0.45);
+  }
+  .autocomplete-box .ac-item{
+    padding:11px 12px;
+    font-size:14px;
+    color:var(--text);
+    border-bottom:1px solid var(--border);
+  }
+  .autocomplete-box .ac-item:last-child{border-bottom:none;}
+  .autocomplete-box .ac-item:active{background:var(--bg-elev);}
+
   /* Workout Screen sticky header (app header is hidden while this is showing,
      so this sticks to the very top of the viewport and handles its own safe-area padding) */
   .workout-sticky-header{
@@ -570,6 +592,7 @@
 </div>
 
 <datalist id="exerciseNames"></datalist>
+<div id="autocompleteBox" class="autocomplete-box"></div>
 
 <script>
   // Chart.js is loaded from a CDN. If the primary CDN is unreachable (network hiccup,

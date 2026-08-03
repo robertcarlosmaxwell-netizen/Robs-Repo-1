@@ -293,6 +293,7 @@ const titles = {
 
 function setView(name) {
   currentView = name;
+  hideAutocomplete();
   Object.entries(views).forEach(([k, el]) => el.classList.toggle('active', k === name));
   tabBtns.forEach(b => b.classList.toggle('active', b.dataset.view === name));
   headerTitle.textContent = titles[name][0];
@@ -331,6 +332,83 @@ function refreshExerciseDatalist() {
   exerciseNamesDatalist.innerHTML = knownExerciseNames()
     .map(n => `<option value="${escapeHtml(n)}">`).join('');
 }
+
+/* ---------- Exercise name autocomplete ----------
+   Native <datalist>/list="" suggestions are unreliable on iOS Safari (long-standing
+   rendering bugs, and a fresh regression in iOS 26), which is why typing an exercise
+   name on the Workout/Routines tabs wasn't showing suggestions. This drives its own
+   lightweight dropdown instead, via event delegation so it keeps working across
+   re-renders. The list="exerciseNames" attribute stays in the markup too — harmless,
+   and still gives desktop browsers a native fallback. */
+const autocompleteBox = document.getElementById('autocompleteBox');
+const AUTOCOMPLETE_SELECTOR = '[data-role="ex-name"], [data-role="rex-name"]';
+let acInput = null;
+
+function hideAutocomplete() {
+  autocompleteBox.style.display = 'none';
+  autocompleteBox.innerHTML = '';
+  acInput = null;
+}
+
+function showAutocompleteFor(input) {
+  const q = input.value.trim().toLowerCase();
+  if (!q) { hideAutocomplete(); return; }
+
+  const matches = knownExerciseNames()
+    .filter(n => n.toLowerCase().includes(q))
+    .sort((a, b) => {
+      const aStarts = a.toLowerCase().startsWith(q) ? 0 : 1;
+      const bStarts = b.toLowerCase().startsWith(q) ? 0 : 1;
+      if (aStarts !== bStarts) return aStarts - bStarts;
+      return a.localeCompare(b);
+    })
+    .slice(0, 8);
+
+  if (matches.length === 0 || (matches.length === 1 && matches[0].toLowerCase() === q)) {
+    hideAutocomplete();
+    return;
+  }
+
+  acInput = input;
+  autocompleteBox.innerHTML = matches.map(n => `<div class="ac-item">${escapeHtml(n)}</div>`).join('');
+
+  const rect = input.getBoundingClientRect();
+  autocompleteBox.style.left = rect.left + 'px';
+  autocompleteBox.style.top = (rect.bottom + 4) + 'px';
+  autocompleteBox.style.width = rect.width + 'px';
+  autocompleteBox.style.display = 'block';
+}
+
+document.addEventListener('input', (e) => {
+  if (e.target.matches && e.target.matches(AUTOCOMPLETE_SELECTOR)) showAutocompleteFor(e.target);
+});
+
+document.addEventListener('focusin', (e) => {
+  if (e.target.matches && e.target.matches(AUTOCOMPLETE_SELECTOR)) showAutocompleteFor(e.target);
+});
+
+document.addEventListener('focusout', (e) => {
+  if (e.target.matches && e.target.matches(AUTOCOMPLETE_SELECTOR)) {
+    // Short delay so a tap on a suggestion (handled on mousedown, below) can still
+    // register before the box gets torn down.
+    setTimeout(() => { if (acInput === e.target) hideAutocomplete(); }, 150);
+  }
+});
+
+// mousedown fires before blur; preventDefault keeps the field focused so picking a
+// suggestion doesn't flicker the on-screen keyboard closed on mobile.
+autocompleteBox.addEventListener('mousedown', (e) => {
+  const item = e.target.closest('.ac-item');
+  if (!item || !acInput) return;
+  e.preventDefault();
+  const input = acInput;
+  input.value = item.textContent;
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  hideAutocomplete();
+});
+
+window.addEventListener('scroll', hideAutocomplete, true);
+window.addEventListener('resize', hideAutocomplete);
 
 function escapeHtml(str) {
   const div = document.createElement('div');
