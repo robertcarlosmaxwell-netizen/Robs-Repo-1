@@ -2,6 +2,7 @@
 const STORAGE_KEY = 'wt_sessions_v1';
 const ROUTINES_KEY = 'wt_routines_v1';
 const ACTIVE_WORKOUT_KEY = 'wt_active_workout_v1';
+const EXERCISE_LIBRARY_KEY = 'wt_exercise_library_v1';
 
 function loadSessions() {
   try {
@@ -51,6 +52,20 @@ function clearActiveWorkoutStorage() {
   localStorage.removeItem(ACTIVE_WORKOUT_KEY);
 }
 
+function loadExerciseLibrary() {
+  try {
+    const raw = localStorage.getItem(EXERCISE_LIBRARY_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch (e) {
+    console.error('Failed to load exercise library', e);
+    return [];
+  }
+}
+
+function saveExerciseLibrary(list) {
+  localStorage.setItem(EXERCISE_LIBRARY_KEY, JSON.stringify(list));
+}
+
 // Normalize routines to { id, name, exercises: [{ name, sets }] }.
 // Older saved routines stored exercises as plain strings — upgrade them in place.
 function normalizeRoutine(r) {
@@ -95,6 +110,49 @@ function allExerciseNames(sessions) {
   return [...seen.values()].sort((a, b) => a.localeCompare(b));
 }
 
+// Autocomplete should offer both exercises saved in the library and any exercise
+// names that only exist in past logged sessions (library entries take precedence
+// for display casing since that's now the canonical source).
+function knownExerciseNames() {
+  const seen = new Map();
+  exerciseLibrary.forEach(n => {
+    const trimmed = (n || '').trim();
+    if (trimmed) seen.set(trimmed.toLowerCase(), trimmed);
+  });
+  allExerciseNames(sessions).forEach(n => {
+    const key = n.toLowerCase();
+    if (!seen.has(key)) seen.set(key, n);
+  });
+  return [...seen.values()].sort((a, b) => a.localeCompare(b));
+}
+
+// If any of the given exercise names aren't in the library yet, ask once (single
+// dialog covering all of them) whether to add them for future autocomplete.
+function promptAddNewExercises(names) {
+  const known = new Set(exerciseLibrary.map(n => n.trim().toLowerCase()));
+  const newOnes = [];
+  const seenThisCall = new Set();
+  (names || []).forEach(n => {
+    const trimmed = (n || '').trim();
+    const key = trimmed.toLowerCase();
+    if (trimmed && !known.has(key) && !seenThisCall.has(key)) {
+      newOnes.push(trimmed);
+      seenThisCall.add(key);
+    }
+  });
+  if (newOnes.length === 0) return;
+
+  const msg = newOnes.length === 1
+    ? `Add "${newOnes[0]}" to your exercise library for future autocomplete?`
+    : `Add these new exercises to your library for future autocomplete?\n\n${newOnes.map(n => '• ' + n).join('\n')}`;
+
+  if (confirm(msg)) {
+    exerciseLibrary = exerciseLibrary.concat(newOnes);
+    saveExerciseLibrary(exerciseLibrary);
+    refreshExerciseDatalist();
+  }
+}
+
 function fmtNum(n) {
   return Math.round(n).toLocaleString();
 }
@@ -136,18 +194,16 @@ function lastPerformanceFor(name) {
 /* ---------- App state ---------- */
 let sessions = loadSessions();
 let routines = loadRoutines().map(normalizeRoutine);
+let exerciseLibrary = loadExerciseLibrary();
 let currentView = 'log';
 let openSessionIds = new Set();
 let draftRoutine = null; // { id: string|null, name: string, exercises: [{name, sets}] }
 let activeWorkout = null; // { startTime: epochMs, date, routineId, routineName } while a workout is in progress
 let timerInterval = null;
 
-/* Keep the sticky Workout Screen header and the fixed End Workout button
-   positioned correctly relative to the app header / bottom tab bar. */
+/* Keep the fixed End Workout button positioned correctly above the bottom tab bar. */
 function syncLayoutVars() {
-  const headerEl = document.querySelector('header');
   const tabbarEl = document.querySelector('nav.tabbar');
-  if (headerEl) document.documentElement.style.setProperty('--header-h', headerEl.offsetHeight + 'px');
   if (tabbarEl) document.documentElement.style.setProperty('--tabbar-h', tabbarEl.offsetHeight + 'px');
 }
 window.addEventListener('resize', syncLayoutVars);
@@ -157,16 +213,19 @@ window.addEventListener('load', syncLayoutVars);
 const views = {
   log: document.getElementById('view-log'),
   routines: document.getElementById('view-routines'),
+  exercises: document.getElementById('view-exercises'),
   history: document.getElementById('view-history'),
   charts: document.getElementById('view-charts'),
 };
 const tabBtns = document.querySelectorAll('.tab-btn');
+const headerEl = document.querySelector('header');
 const headerTitle = document.getElementById('headerTitle');
 const headerSubtitle = document.getElementById('headerSubtitle');
 
 const titles = {
   log: ['Workout', "Log today's session"],
   routines: ['Routines', 'Build & manage your routines'],
+  exercises: ['Exercises', 'Your exercise library'],
   history: ['History', 'Past workout sessions'],
   charts: ['Progress', 'Volume load over time'],
 };
@@ -177,9 +236,11 @@ function setView(name) {
   tabBtns.forEach(b => b.classList.toggle('active', b.dataset.view === name));
   headerTitle.textContent = titles[name][0];
   headerSubtitle.textContent = titles[name][1];
+  if (name !== 'log') headerEl.style.display = '';
   if (name === 'history') renderHistory();
   if (name === 'charts') renderCharts();
   if (name === 'routines') renderRoutineList();
+  if (name === 'exercises') renderExerciseLibrary();
   if (name === 'log') {
     renderExerciseList();
     if (activeWorkout) showWorkoutScreen(); else showPreWorkoutScreen();
@@ -206,7 +267,7 @@ const exerciseNamesDatalist = document.getElementById('exerciseNames');
 sessionDateInput.value = todayStr();
 
 function refreshExerciseDatalist() {
-  exerciseNamesDatalist.innerHTML = allExerciseNames(sessions)
+  exerciseNamesDatalist.innerHTML = knownExerciseNames()
     .map(n => `<option value="${escapeHtml(n)}">`).join('');
 }
 
@@ -342,12 +403,25 @@ function showPreWorkoutScreen() {
   preWorkoutScreenEl.style.display = 'block';
   workoutScreenEl.style.display = 'none';
   endWorkoutBtn.style.display = 'none';
+  headerEl.style.display = '';
 }
+
+// iOS often "resumes" a standalone home-screen app from a frozen/suspended state
+// instead of re-running app.js from scratch, so the date field can be left showing
+// whatever it had when the app was last backgrounded. pageshow fires on every resume
+// (including bfcache restores), so re-stamp today's date whenever we're sitting on
+// the Pre-Workout Screen with no workout in progress.
+window.addEventListener('pageshow', () => {
+  if (!activeWorkout && preWorkoutScreenEl.style.display !== 'none') {
+    sessionDateInput.value = todayStr();
+  }
+});
 
 function showWorkoutScreen() {
   preWorkoutScreenEl.style.display = 'none';
   workoutScreenEl.style.display = 'block';
   endWorkoutBtn.style.display = 'flex';
+  headerEl.style.display = 'none'; // sticky routine/date/timer bar replaces it while a workout is active
   activeRoutineNameEl.textContent = activeWorkout.routineName || 'Freestyle Workout';
   activeWorkoutDateEl.textContent = fmtDate(activeWorkout.date);
   syncLayoutVars();
@@ -429,6 +503,7 @@ endWorkoutBtn.addEventListener('click', () => {
     });
     saveSessions(sessions);
     refreshExerciseDatalist();
+    promptAddNewExercises(cleanExercises.map(ex => ex.name));
     showToast(`Workout saved ✓ (${formatDuration(durationSeconds)})`);
   } else {
     showToast('Workout ended — no sets logged, nothing saved');
@@ -494,7 +569,7 @@ function renderRoutineList() {
 function openRoutineEditor(routine) {
   draftRoutine = routine
     ? { id: routine.id, name: routine.name, exercises: routine.exercises.map(e => ({ ...e })) }
-    : { id: null, name: '', exercises: [{ name: '', sets: 3 }] };
+    : { id: null, name: '', exercises: [{ name: '', sets: '' }] };
   routineNameInput.value = draftRoutine.name;
   renderRoutineExerciseInputs();
   routineEditorEl.style.display = 'block';
@@ -527,7 +602,7 @@ function renderRoutineExerciseInputs() {
     });
     row.querySelector('[data-role="remove-rex"]').addEventListener('click', () => {
       draftRoutine.exercises.splice(i, 1);
-      if (draftRoutine.exercises.length === 0) draftRoutine.exercises.push({ name: '', sets: 3 });
+      if (draftRoutine.exercises.length === 0) draftRoutine.exercises.push({ name: '', sets: '' });
       renderRoutineExerciseInputs();
     });
     routineExerciseListEl.appendChild(row);
@@ -537,7 +612,7 @@ function renderRoutineExerciseInputs() {
 document.getElementById('newRoutineBtn').addEventListener('click', () => openRoutineEditor(null));
 
 document.getElementById('addRoutineExerciseBtn').addEventListener('click', () => {
-  draftRoutine.exercises.push({ name: '', sets: 3 });
+  draftRoutine.exercises.push({ name: '', sets: '' });
   renderRoutineExerciseInputs();
 });
 
@@ -551,11 +626,13 @@ document.getElementById('saveRoutineBtn').addEventListener('click', () => {
   if (!draftRoutine) return;
   const name = (draftRoutine.name || '').trim();
   const exs = draftRoutine.exercises
-    .map(e => ({ name: (e.name || '').trim(), sets: Math.max(1, parseInt(e.sets, 10) || 1) }))
+    .map(e => ({ name: (e.name || '').trim(), sets: Math.max(1, parseInt(e.sets, 10) || 3) }))
     .filter(e => e.name);
 
   if (!name) { showToast('Give the routine a name'); return; }
   if (exs.length === 0) { showToast('Add at least one exercise'); return; }
+
+  promptAddNewExercises(exs.map(e => e.name));
 
   if (draftRoutine.id) {
     const r = routines.find(x => x.id === draftRoutine.id);
@@ -569,6 +646,61 @@ document.getElementById('saveRoutineBtn').addEventListener('click', () => {
   renderRoutineList();
   populateRoutineSelect();
   showToast('Routine saved ✓');
+});
+
+/* ---------- EXERCISES VIEW (library) ---------- */
+const exerciseLibraryListEl = document.getElementById('exerciseLibraryList');
+const newExerciseInput = document.getElementById('newExerciseInput');
+
+function renderExerciseLibrary() {
+  const sorted = [...exerciseLibrary].sort((a, b) => a.localeCompare(b));
+
+  if (sorted.length === 0) {
+    exerciseLibraryListEl.innerHTML = `
+      <div class="empty-state">
+        <div class="big">💪</div>
+        No exercises saved yet.<br>Add the ones you use often for quicker autocomplete on the Workout and Routines tabs.
+      </div>`;
+    return;
+  }
+
+  exerciseLibraryListEl.innerHTML = '';
+  sorted.forEach(name => {
+    const row = document.createElement('div');
+    row.className = 'session-card';
+    row.innerHTML = `
+      <div class="session-head" style="cursor:default;">
+        <div class="date" style="font-size:15px;">${escapeHtml(name)}</div>
+        <button class="btn btn-danger btn-sm" data-role="delete-ex">Delete</button>
+      </div>
+    `;
+    row.querySelector('[data-role="delete-ex"]').addEventListener('click', () => {
+      if (confirm(`Remove "${name}" from your exercise library? Past logged workouts aren't affected.`)) {
+        exerciseLibrary = exerciseLibrary.filter(n => n.toLowerCase() !== name.toLowerCase());
+        saveExerciseLibrary(exerciseLibrary);
+        renderExerciseLibrary();
+        refreshExerciseDatalist();
+      }
+    });
+    exerciseLibraryListEl.appendChild(row);
+  });
+}
+
+document.getElementById('addLibraryExerciseBtn').addEventListener('click', () => {
+  const name = newExerciseInput.value.trim();
+  if (!name) { showToast('Type an exercise name first'); return; }
+  const key = name.toLowerCase();
+  if (exerciseLibrary.some(n => n.toLowerCase() === key)) {
+    showToast('Already in your library');
+    newExerciseInput.value = '';
+    return;
+  }
+  exerciseLibrary.push(name);
+  saveExerciseLibrary(exerciseLibrary);
+  newExerciseInput.value = '';
+  renderExerciseLibrary();
+  refreshExerciseDatalist();
+  showToast(`Added "${name}"`);
 });
 
 /* ---------- HISTORY VIEW ---------- */
@@ -661,6 +793,12 @@ function renderCharts() {
 }
 
 chartExerciseSelect.addEventListener('change', () => drawChartFor(chartExerciseSelect.value));
+
+// If Chart.js was still loading (or a CDN attempt failed and a fallback kicked in) when
+// the user first opened this tab, redraw automatically the moment it becomes available.
+window.addEventListener('chartjs-ready', () => {
+  if (currentView === 'charts') renderCharts();
+});
 
 function drawChartFor(exerciseName) {
   if (!exerciseName) return;

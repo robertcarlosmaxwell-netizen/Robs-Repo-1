@@ -1,4 +1,7 @@
-const CACHE_NAME = 'workout-tracker-v1';
+// Bump this version string any time index.html/app.js/manifest.json/icons change.
+// The browser re-installs the service worker whenever this file's bytes change, which
+// is what actually pushes updated app files out to people who already installed the app.
+const CACHE_NAME = 'workout-tracker-v3';
 const ASSETS = [
   './',
   './index.html',
@@ -9,6 +12,7 @@ const ASSETS = [
 ];
 const CDN_ASSETS = [
   'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js',
+  'https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js',
 ];
 
 self.addEventListener('install', (event) => {
@@ -45,7 +49,7 @@ self.addEventListener('fetch', (event) => {
           }
           return response;
         })
-        .catch(() => cached);
+        .catch(() => cached || new Response('', { status: 503, statusText: 'Offline' }));
     })
   );
 });

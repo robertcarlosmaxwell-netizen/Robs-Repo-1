@@ -31,11 +31,11 @@
     --radius:14px;
     --safe-bottom: env(safe-area-inset-bottom, 0px);
     --safe-top: env(safe-area-inset-top, 0px);
-    --header-h: 64px;
     --tabbar-h: 70px;
   }
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
   html,body{height:100%;}
+  html{color-scheme:dark;}
   body{
     margin:0;
     background:var(--bg);
@@ -91,17 +91,19 @@
   }
   nav.tabbar button{
     flex:1;
+    min-width:0;
     background:none;
     border:none;
     color:var(--text-dim);
-    font-size:11px;
+    font-size:10px;
     font-weight:600;
-    padding:10px 4px 8px;
+    padding:10px 2px 8px;
     display:flex;
     flex-direction:column;
     align-items:center;
     gap:3px;
     font-family:inherit;
+    white-space:nowrap;
   }
   nav.tabbar button .ic{font-size:20px;line-height:1;}
   nav.tabbar button.active{color:var(--accent);}
@@ -141,6 +143,8 @@
     font-size:16px;
     font-family:inherit;
     outline:none;
+    height:44px;
+    line-height:1.2;
   }
   input:focus, select:focus{border-color:var(--accent);}
 
@@ -353,15 +357,16 @@
     text-align:center;
   }
 
-  /* Workout Screen sticky header */
+  /* Workout Screen sticky header (app header is hidden while this is showing,
+     so this sticks to the very top of the viewport and handles its own safe-area padding) */
   .workout-sticky-header{
     position:sticky;
-    top:var(--header-h, 64px);
+    top:0;
     z-index:4;
     background:var(--bg);
     border-bottom:1px solid var(--border);
     margin:-16px -16px 14px;
-    padding:12px 16px;
+    padding:calc(14px + var(--safe-top)) 16px 12px;
   }
   .workout-routine-name{
     font-size:16px;
@@ -438,7 +443,7 @@
 
         <div class="card">
           <label for="sessionDate">Date</label>
-          <input type="date" id="sessionDate">
+          <input type="date" id="sessionDate" autocomplete="off">
         </div>
 
         <button class="btn btn-primary btn-block" id="startWorkoutBtn">Start Workout</button>
@@ -482,6 +487,16 @@
       </div>
     </section>
 
+    <!-- EXERCISES VIEW -->
+    <section id="view-exercises" class="view">
+      <div class="card">
+        <label for="newExerciseInput">Add an exercise</label>
+        <input type="text" id="newExerciseInput" placeholder="e.g. Cable Fly">
+        <button class="btn btn-primary btn-block" id="addLibraryExerciseBtn" style="margin-top:10px;">Add</button>
+      </div>
+      <div id="exerciseLibraryList"></div>
+    </section>
+
     <!-- HISTORY VIEW -->
     <section id="view-history" class="view">
       <div id="historyList"></div>
@@ -504,6 +519,9 @@
     <button class="tab-btn" data-view="routines">
       <span class="ic">📋</span><span>Routines</span>
     </button>
+    <button class="tab-btn" data-view="exercises">
+      <span class="ic">💪</span><span>Exercises</span>
+    </button>
     <button class="tab-btn" data-view="history">
       <span class="ic">📜</span><span>History</span>
     </button>
@@ -517,7 +535,24 @@
 
 <datalist id="exerciseNames"></datalist>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<script>
+  // Chart.js is loaded from a CDN. If the primary CDN is unreachable (network hiccup,
+  // ad/content blocker, regional block), automatically try a couple of alternates
+  // before giving up. This only needs to finish before the user opens the Charts tab,
+  // so loading it this way (instead of a single blocking <script src>) is safe.
+  (function loadChartJs(urls) {
+    if (!urls.length) return;
+    const s = document.createElement('script');
+    s.src = urls[0];
+    s.onload = () => window.dispatchEvent(new Event('chartjs-ready'));
+    s.onerror = () => loadChartJs(urls.slice(1));
+    document.head.appendChild(s);
+  })([
+    'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js',
+    'https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js',
+    'https://unpkg.com/chart.js@4.4.4/dist/chart.umd.min.js',
+  ]);
+</script>
 <script src="app.js"></script>
 </body>
 </html>
