@@ -340,6 +340,31 @@
   .toast.show{opacity:1; transform:translateX(-50%) translateY(0);}
 
   /* Sets table (Set / Prev / Weight / Reps) */
+  /* "What you noted last time" banner, above the set-table column headers */
+  .prev-note{
+    display:flex;
+    gap:8px;
+    align-items:baseline;
+    margin:-2px 0 10px;
+    padding:8px 10px;
+    background:var(--bg-elev);
+    border-left:3px solid var(--accent-dim);
+    border-radius:0 8px 8px 0;
+    font-size:12px;
+    line-height:1.45;
+    color:var(--text-dim);
+  }
+  .prev-note[hidden]{display:none;}
+  .prev-note .prev-note-date{
+    flex-shrink:0;
+    font-size:10px;
+    font-weight:700;
+    letter-spacing:0.03em;
+    text-transform:uppercase;
+    color:var(--accent);
+  }
+  .prev-note .prev-note-text{min-width:0; overflow-wrap:anywhere;}
+
   .sets-header{
     display:flex;
     align-items:center;

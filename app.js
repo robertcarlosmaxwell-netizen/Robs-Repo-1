@@ -249,7 +249,7 @@ function lastPerformanceFor(name) {
   if (matches.length === 0) return null;
   const session = matches[0];
   const ex = session.exercises.find(e => exerciseMatchKey(e) === targetKey);
-  return { date: session.date, sets: ex.sets, volume: exerciseVolume(ex) };
+  return { date: session.date, sets: ex.sets, volume: exerciseVolume(ex), notes: (ex.notes || '').trim() };
 }
 
 /* ---------- App state ---------- */
@@ -422,6 +422,24 @@ function newDraftExercise(name = '') {
   return { id: uid(), name, sets: [{ weight: '', reps: '' }], notes: '' };
 }
 
+// Show/hide + fill the "note from last time" banner for one exercise block.
+// Reads from the same past session the PREV column is showing, so everything on
+// the card refers to one consistent previous workout.
+function updateBlockPrevNote(block, perf) {
+  const noteEl = block.querySelector('[data-role="prev-note"]');
+  if (!noteEl) return;
+  const note = perf && perf.notes ? perf.notes : '';
+  if (!note) {
+    noteEl.hidden = true;
+    return;
+  }
+  noteEl.hidden = false;
+  const dateEl = noteEl.querySelector('[data-role="prev-note-date"]');
+  const textEl = noteEl.querySelector('[data-role="prev-note-text"]');
+  if (dateEl) dateEl.textContent = fmtDateShort(perf.date);
+  if (textEl) textEl.textContent = note;
+}
+
 // Refresh the "PREV" header + per-set previous values for one exercise block
 // without rebuilding the DOM (keeps focus/cursor position while typing the name).
 function updateBlockPrevData(block, ex) {
@@ -432,6 +450,7 @@ function updateBlockPrevData(block, ex) {
     const s = perf && perf.sets[si];
     el.textContent = s ? `${s.weight}×${s.reps}` : '—';
   });
+  updateBlockPrevNote(block, perf);
 }
 
 function renderExerciseList() {
@@ -450,6 +469,18 @@ function renderExerciseList() {
     block.appendChild(head);
 
     const perf = lastPerformanceFor(ex.name);
+
+    // Note from the last time this exercise was performed. Sits between the
+    // exercise name and the set-table column headers; hidden when there is none.
+    const prevNote = document.createElement('div');
+    prevNote.className = 'prev-note';
+    prevNote.dataset.role = 'prev-note';
+    prevNote.innerHTML = `
+      <span class="prev-note-date" data-role="prev-note-date"></span>
+      <span class="prev-note-text" data-role="prev-note-text"></span>
+    `;
+    block.appendChild(prevNote);
+    updateBlockPrevNote(block, perf);
 
     const setsHeader = document.createElement('div');
     setsHeader.className = 'sets-header';
