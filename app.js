@@ -3,6 +3,8 @@ const STORAGE_KEY = 'wt_sessions_v1';
 const ROUTINES_KEY = 'wt_routines_v1';
 const ACTIVE_WORKOUT_KEY = 'wt_active_workout_v1';
 const EXERCISE_LIBRARY_KEY = 'wt_exercise_library_v1';
+const BODYWEIGHT_KEY = 'wt_bodyweight_v1';
+const SYNC_CONFIG_KEY = 'wt_sync_config_v1';
 
 function loadSessions() {
   try {
@@ -66,6 +68,46 @@ function saveExerciseLibrary(list) {
   localStorage.setItem(EXERCISE_LIBRARY_KEY, JSON.stringify(list));
 }
 
+/* Body weight log. One entry per date — logging the same date again replaces it,
+   so there is never more than one weigh-in per day to average over. */
+function loadBodyWeights() {
+  try {
+    const raw = localStorage.getItem(BODYWEIGHT_KEY);
+    const list = raw ? JSON.parse(raw) : [];
+    return Array.isArray(list) ? list : [];
+  } catch (e) {
+    console.error('Failed to load body weights', e);
+    return [];
+  }
+}
+
+function saveBodyWeights(list) {
+  localStorage.setItem(BODYWEIGHT_KEY, JSON.stringify(list));
+}
+
+/* Cloud sync settings. The Apps Script URL is a write capability for the
+   spreadsheet, so it is entered on the device and kept in localStorage —
+   never committed to the (public) repo. */
+function loadSyncConfig() {
+  try {
+    const raw = localStorage.getItem(SYNC_CONFIG_KEY);
+    const cfg = raw ? JSON.parse(raw) : {};
+    return {
+      url: cfg.url || '',
+      token: cfg.token || '',
+      lastSyncedAt: cfg.lastSyncedAt || null,
+      lastError: cfg.lastError || null,
+    };
+  } catch (e) {
+    console.error('Failed to load sync config', e);
+    return { url: '', token: '', lastSyncedAt: null, lastError: null };
+  }
+}
+
+function saveSyncConfig(cfg) {
+  localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(cfg));
+}
+
 // Normalize routines to { id, name, exercises: [{ name, sets, exerciseId }] }.
 // Older saved routines stored exercises as plain strings — upgrade them in place.
 function normalizeRoutine(r) {
@@ -81,8 +123,15 @@ function normalizeRoutine(r) {
 }
 
 // Older saved libraries stored exercises as plain strings — give them stable IDs.
+// `inverted` marks exercises where a HIGHER logged number means you were WEAKER —
+// assisted pull-up/chin-up machines, where the number is how much weight the machine
+// takes off you. Without this the charts read exactly backwards for those lifts.
 function normalizeExerciseLibrary(list) {
-  return (list || []).map(e => (typeof e === 'string' ? { id: uid(), name: e } : e));
+  return (list || []).map(e => (
+    typeof e === 'string'
+      ? { id: uid(), name: e, inverted: false }
+      : { ...e, inverted: !!e.inverted }
+  ));
 }
 
 function uid() {
@@ -252,10 +301,56 @@ function lastPerformanceFor(name) {
   return { date: session.date, sets: ex.sets, volume: exerciseVolume(ex), notes: (ex.notes || '').trim() };
 }
 
+// True when the exercise's logged weight is "assistance" rather than load, so
+// lower is better. Resolved through the library, so it follows renames.
+function isInvertedExerciseName(name) {
+  const entry = findExerciseByName(name);
+  return !!(entry && entry.inverted);
+}
+
+/* ---------- Body weight helpers ---------- */
+function sortedBodyWeights() {
+  return [...bodyWeights].sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function bodyWeightFor(date) {
+  const hit = bodyWeights.find(w => w.date === date);
+  return hit ? hit.weight : null;
+}
+
+// One entry per date: logging a date that already exists updates it in place and
+// keeps the original id, so a re-sync updates the same spreadsheet row.
+function upsertBodyWeight(date, weight) {
+  const existing = bodyWeights.find(w => w.date === date);
+  if (existing) {
+    existing.weight = weight;
+    existing.loggedAt = new Date().toISOString();
+  } else {
+    bodyWeights.push({ id: uid(), date, weight, loggedAt: new Date().toISOString() });
+  }
+  saveBodyWeights(bodyWeights);
+  return existing ? 'updated' : 'added';
+}
+
+// Rolling average over the last `days` calendar days that actually have entries.
+// Daily weight swings 2-4 lb on water alone; the average is the only readable signal.
+function bodyWeightAverage(days = 7, endDate = todayStr()) {
+  const end = new Date(endDate + 'T00:00:00');
+  const start = new Date(end.getTime() - (days - 1) * 86400000);
+  const startStr = start.toISOString().slice(0, 10);
+  const inWindow = bodyWeights.filter(w => w.date >= startStr && w.date <= endDate);
+  if (inWindow.length === 0) return null;
+  const sum = inWindow.reduce((acc, w) => acc + (Number(w.weight) || 0), 0);
+  return { avg: sum / inWindow.length, count: inWindow.length };
+}
+
 /* ---------- App state ---------- */
 let sessions = loadSessions();
 let routines = loadRoutines().map(normalizeRoutine);
 let exerciseLibrary = normalizeExerciseLibrary(loadExerciseLibrary());
+let bodyWeights = loadBodyWeights();
+let syncConfig = loadSyncConfig();
+let editingSessionId = null;
 let currentView = 'log';
 let openSessionIds = new Set();
 let draftRoutine = null; // { id: string|null, name: string, exercises: [{name, sets}] }
@@ -327,6 +422,60 @@ const exerciseListEl = document.getElementById('exerciseList');
 const exerciseNamesDatalist = document.getElementById('exerciseNames');
 
 sessionDateInput.value = todayStr();
+
+/* ---------- Daily weigh-in ---------- */
+const bwDateInput = document.getElementById('bwDate');
+const bwWeightInput = document.getElementById('bwWeight');
+const bwStatsEl = document.getElementById('bwStats');
+
+bwDateInput.value = todayStr();
+
+function renderBodyWeightCard() {
+  const date = bwDateInput.value || todayStr();
+  const existing = bodyWeightFor(date);
+  if (document.activeElement !== bwWeightInput) {
+    bwWeightInput.value = existing == null ? '' : existing;
+  }
+
+  const avg7 = bodyWeightAverage(7);
+  const all = sortedBodyWeights();
+  const recent = all.slice(-5).reverse();
+
+  if (all.length === 0) {
+    bwStatsEl.innerHTML = 'No weigh-ins yet. The daily number is noise — the 7-day average is the signal, so log it most mornings and ignore any single reading.';
+    return;
+  }
+
+  const first = all[0];
+  const latest = all[all.length - 1];
+  const change = latest.weight - first.weight;
+  const changeStr = `${change >= 0 ? '+' : ''}${(Math.round(change * 10) / 10).toFixed(1)}`;
+
+  bwStatsEl.innerHTML = `
+    ${avg7 ? `7-day avg <span class="bw-avg">${(Math.round(avg7.avg * 10) / 10).toFixed(1)} lb</span> <span style="opacity:.7;">(${avg7.count} of 7 days)</span><br>` : ''}
+    Since ${fmtDateShort(first.date)}: ${escapeHtml(changeStr)} lb over ${all.length} weigh-in${all.length !== 1 ? 's' : ''}
+    <div class="bw-recent">
+      ${recent.map(w => `<span class="bw-chip${w.date === todayStr() ? ' today' : ''}">${fmtDateShort(w.date)} · ${w.weight}</span>`).join('')}
+    </div>
+  `;
+}
+
+bwDateInput.addEventListener('change', renderBodyWeightCard);
+
+document.getElementById('bwSaveBtn').addEventListener('click', () => {
+  const date = bwDateInput.value || todayStr();
+  const raw = bwWeightInput.value;
+  const weight = Number(raw);
+  if (raw === '' || isNaN(weight) || weight <= 0) {
+    showToast('Enter a weight first');
+    return;
+  }
+  const action = upsertBodyWeight(date, weight);
+  renderBodyWeightCard();
+  if (currentView === 'charts') renderCharts();
+  showToast(action === 'updated' ? 'Weigh-in updated ✓' : 'Weigh-in logged ✓');
+  scheduleSync();
+});
 
 function refreshExerciseDatalist() {
   exerciseNamesDatalist.innerHTML = knownExerciseNames()
@@ -680,6 +829,7 @@ endWorkoutBtn.addEventListener('click', () => {
     saveSessions(sessions);
     refreshExerciseDatalist();
     showToast(`Workout saved ✓ (${formatDuration(durationSeconds)})`);
+    scheduleSync();
   } else {
     showToast('Workout ended — no sets logged, nothing saved');
   }
@@ -846,13 +996,28 @@ function renderExerciseLibrary() {
     row.className = 'session-card';
     row.innerHTML = `
       <div class="session-head" style="cursor:default;">
-        <div class="date" style="font-size:15px;">${escapeHtml(entry.name)}</div>
+        <div class="date" style="font-size:15px;">${escapeHtml(entry.name)}${entry.inverted ? '<span class="inverted-tag">ASSIST</span>' : ''}</div>
         <div class="row" style="flex:0 0 auto; gap:8px;">
           <button class="btn btn-secondary btn-sm" data-role="rename-ex">Rename</button>
           <button class="btn btn-danger btn-sm" data-role="delete-ex">Delete</button>
         </div>
       </div>
+      <div class="session-body open" style="padding-top:10px;">
+        <label style="display:flex; align-items:center; gap:10px; font-size:12px; color:var(--text-dim); margin:0;">
+          <input type="checkbox" data-role="invert-ex" ${entry.inverted ? 'checked' : ''}
+            style="width:auto; min-height:0; margin:0; flex:0 0 auto;">
+          <span>Weight logged is <strong>assistance</strong> — lower is better (e.g. assisted chin-ups)</span>
+        </label>
+      </div>
     `;
+    row.querySelector('[data-role="invert-ex"]').addEventListener('change', (e) => {
+      entry.inverted = e.target.checked;
+      saveExerciseLibrary(exerciseLibrary);
+      renderExerciseLibrary();
+      showToast(entry.inverted
+        ? 'Charts for this exercise now read lower = better'
+        : 'Charts back to higher = better');
+    });
     row.querySelector('[data-role="rename-ex"]').addEventListener('click', () => {
       const input = prompt('Rename exercise:', entry.name);
       if (input === null) return; // cancelled
@@ -924,6 +1089,10 @@ function renderHistory() {
 
   historyListEl.innerHTML = '';
   sorted.forEach(session => {
+    if (editingSessionId === session.id) {
+      historyListEl.appendChild(renderSessionEditorCard(session));
+      return;
+    }
     const vol = sessionVolume(session);
     const card = document.createElement('div');
     card.className = 'session-card';
@@ -946,7 +1115,8 @@ function renderHistory() {
             ${ex.notes ? `<div class="ex-notes">📝 ${escapeHtml(ex.notes)}</div>` : ''}
           </div>
         `).join('')}
-        <div class="session-actions">
+        <div class="session-actions" style="justify-content:space-between;">
+          <button class="btn btn-secondary btn-sm" data-role="edit">Edit</button>
           <button class="btn btn-danger btn-sm" data-role="delete">Delete Session</button>
         </div>
       </div>
@@ -958,6 +1128,13 @@ function renderHistory() {
       renderHistory();
     });
 
+    card.querySelector('[data-role="edit"]').addEventListener('click', (e) => {
+      e.stopPropagation();
+      editingSessionId = session.id;
+      openSessionIds.add(session.id);
+      renderHistory();
+    });
+
     card.querySelector('[data-role="delete"]').addEventListener('click', (e) => {
       e.stopPropagation();
       if (confirm(`Delete workout from ${fmtDate(session.date)}? This can't be undone.`)) {
@@ -965,6 +1142,7 @@ function renderHistory() {
         saveSessions(sessions);
         refreshExerciseDatalist();
         renderHistory();
+        scheduleSync();
       }
     });
 
@@ -972,15 +1150,136 @@ function renderHistory() {
   });
 }
 
+/* Editor for a workout that's already been saved. Works on a deep copy so
+   Cancel really cancels, and writes back over the original id on Save — which
+   keeps the sync keys stable, so corrected rows update in the spreadsheet
+   instead of appearing twice. */
+function renderSessionEditorCard(session) {
+  const draft = {
+    ...session,
+    exercises: session.exercises.map(ex => ({ ...ex, sets: ex.sets.map(s => ({ ...s })) })),
+  };
+
+  const card = document.createElement('div');
+  card.className = 'session-card';
+
+  const head = document.createElement('div');
+  head.className = 'session-head';
+  head.style.cursor = 'default';
+  head.innerHTML = `
+    <div>
+      <div class="date">${fmtDate(session.date)}</div>
+      <div class="meta">Editing</div>
+    </div>
+  `;
+  card.appendChild(head);
+
+  const body = document.createElement('div');
+  body.className = 'session-body open';
+  card.appendChild(body);
+
+  function paint() {
+    body.innerHTML = '<div class="editing-banner">Fix a weight, a rep count, or a note. Removing every set of an exercise removes the exercise.</div>';
+
+    draft.exercises.forEach((ex, exIdx) => {
+      const wrap = document.createElement('div');
+      wrap.className = 'ex-row';
+
+      const nameRow = document.createElement('div');
+      nameRow.className = 'edit-ex-name';
+      nameRow.innerHTML = `
+        <span>${escapeHtml(displayExerciseName(ex))}</span>
+        <button class="btn btn-danger btn-sm" data-role="rm-ex">Remove</button>
+      `;
+      nameRow.querySelector('[data-role="rm-ex"]').addEventListener('click', () => {
+        draft.exercises.splice(exIdx, 1);
+        paint();
+      });
+      wrap.appendChild(nameRow);
+
+      ex.sets.forEach((set, setIdx) => {
+        const row = document.createElement('div');
+        row.className = 'edit-row';
+        row.innerHTML = `
+          <span class="set-idx">${setIdx + 1}</span>
+          <input type="number" inputmode="decimal" step="any" min="0" value="${set.weight}" data-role="e-weight" placeholder="Weight">
+          <input type="number" inputmode="numeric" step="1" min="0" value="${set.reps}" data-role="e-reps" placeholder="Reps">
+          <button class="remove-set" data-role="e-rm" title="Remove set">–</button>
+        `;
+        row.querySelector('[data-role="e-weight"]').addEventListener('input', (e) => { set.weight = e.target.value; });
+        row.querySelector('[data-role="e-reps"]').addEventListener('input', (e) => { set.reps = e.target.value; });
+        row.querySelector('[data-role="e-rm"]').addEventListener('click', () => {
+          ex.sets.splice(setIdx, 1);
+          if (ex.sets.length === 0) draft.exercises.splice(exIdx, 1);
+          paint();
+        });
+        wrap.appendChild(row);
+      });
+
+      const notes = document.createElement('div');
+      notes.className = 'notes-row';
+      notes.innerHTML = `<input type="text" placeholder="Notes (optional)" value="${escapeHtml(ex.notes || '')}" data-role="e-notes">`;
+      notes.querySelector('[data-role="e-notes"]').addEventListener('input', (e) => { ex.notes = e.target.value; });
+      wrap.appendChild(notes);
+
+      body.appendChild(wrap);
+    });
+
+    const actions = document.createElement('div');
+    actions.className = 'session-actions';
+    actions.style.justifyContent = 'space-between';
+    actions.innerHTML = `
+      <button class="btn btn-secondary btn-sm" data-role="cancel">Cancel</button>
+      <button class="btn btn-primary btn-sm" data-role="save">Save Changes</button>
+    `;
+    actions.querySelector('[data-role="cancel"]').addEventListener('click', () => {
+      editingSessionId = null;
+      renderHistory();
+    });
+    actions.querySelector('[data-role="save"]').addEventListener('click', () => {
+      const cleaned = draft.exercises
+        .map(ex => ({
+          ...ex,
+          notes: (ex.notes || '').trim(),
+          sets: ex.sets
+            .filter(s => s.weight !== '' && s.reps !== '' && !isNaN(Number(s.weight)) && !isNaN(Number(s.reps)))
+            .map(s => ({ weight: Number(s.weight), reps: Number(s.reps) })),
+        }))
+        .filter(ex => ex.sets.length > 0);
+
+      if (cleaned.length === 0) {
+        showToast('A workout needs at least one set — delete the session instead');
+        return;
+      }
+
+      const idx = sessions.findIndex(s => s.id === session.id);
+      if (idx !== -1) {
+        sessions[idx] = { ...sessions[idx], exercises: cleaned, editedAt: new Date().toISOString() };
+        saveSessions(sessions);
+      }
+      editingSessionId = null;
+      refreshExerciseDatalist();
+      renderHistory();
+      showToast('Workout updated ✓');
+      scheduleSync();
+    });
+    body.appendChild(actions);
+  }
+
+  paint();
+  return card;
+}
+
 /* ---------- Backup / Export / Import ---------- */
 function buildBackupPayload() {
   return {
     format: 'workout-tracker-backup',
-    version: 1,
+    version: 2,
     exportedAt: new Date().toISOString(),
     sessions,
     routines,
     exerciseLibrary,
+    bodyWeights,
   };
 }
 
@@ -1035,6 +1334,18 @@ document.getElementById('exportCsvBtn').addEventListener('click', () => {
   showToast('CSV downloaded');
 });
 
+function buildWeightCsv() {
+  const rows = [['Date', 'Weight']];
+  sortedBodyWeights().forEach(w => rows.push([w.date, w.weight]));
+  return rows.map(r => r.map(csvEscape).join(',')).join('\r\n');
+}
+
+document.getElementById('exportWeightCsvBtn').addEventListener('click', () => {
+  if (bodyWeights.length === 0) { showToast('No weigh-ins logged yet'); return; }
+  triggerDownload(`bodyweight-${todayStr()}.csv`, buildWeightCsv(), 'text/csv');
+  showToast('Weight CSV downloaded');
+});
+
 // Merge an imported backup into current data. Never deletes or overwrites anything
 // that's already there — only adds records whose id isn't already present. Returns
 // counts of what was actually added, or throws if the file doesn't look like a backup.
@@ -1055,11 +1366,25 @@ function applyImportedBackup(data) {
   const newLibEntries = normalizeExerciseLibrary(data.exerciseLibrary).filter(e => e && e.id && !existingLibIds.has(e.id));
   exerciseLibrary = exerciseLibrary.concat(newLibEntries);
 
+  // Body weights arrived in v2 backups; older files simply won't have the key.
+  // Matched on date rather than id, since there is only ever one weigh-in per day.
+  const existingWeightDates = new Set(bodyWeights.map(w => w.date));
+  const newWeights = (Array.isArray(data.bodyWeights) ? data.bodyWeights : [])
+    .filter(w => w && w.date && !existingWeightDates.has(w.date))
+    .map(w => ({ id: w.id || uid(), date: w.date, weight: Number(w.weight) || 0, loggedAt: w.loggedAt || null }));
+  bodyWeights = bodyWeights.concat(newWeights);
+
   saveSessions(sessions);
   saveRoutines(routines);
   saveExerciseLibrary(exerciseLibrary);
+  saveBodyWeights(bodyWeights);
 
-  return { sessions: newSessions.length, routines: newRoutines.length, exercises: newLibEntries.length };
+  return {
+    sessions: newSessions.length,
+    routines: newRoutines.length,
+    exercises: newLibEntries.length,
+    weights: newWeights.length,
+  };
 }
 
 const importFileInput = document.getElementById('importFileInput');
@@ -1075,7 +1400,8 @@ importFileInput.addEventListener('change', (e) => {
       refreshExerciseDatalist();
       populateRoutineSelect();
       renderHistory();
-      showToast(`Restored ${added.sessions} workout${added.sessions !== 1 ? 's' : ''}, ${added.routines} routine${added.routines !== 1 ? 's' : ''}, ${added.exercises} exercise${added.exercises !== 1 ? 's' : ''}`);
+      renderBodyWeightCard();
+      showToast(`Restored ${added.sessions} workout${added.sessions !== 1 ? 's' : ''}, ${added.routines} routine${added.routines !== 1 ? 's' : ''}, ${added.exercises} exercise${added.exercises !== 1 ? 's' : ''}, ${added.weights} weigh-in${added.weights !== 1 ? 's' : ''}`);
     } catch (err) {
       console.error(err);
       showToast("Couldn't read that file — is it a workout tracker backup?");
@@ -1086,37 +1412,227 @@ importFileInput.addEventListener('change', (e) => {
   reader.readAsText(file);
 });
 
+/* ---------- CLOUD SYNC ----------
+   iOS gives an installed PWA no background execution at all — no Background Sync,
+   no Periodic Background Sync, no Background Fetch. So there is no such thing as a
+   nightly push from here. Instead we sync whenever the app is actually in front of
+   the user: on launch, when it becomes visible again, and after anything is saved.
+   Since a weigh-in happens daily, that works out to roughly daily in practice.
+
+   Every row carries a stable key, and the receiving Apps Script upserts on it, so
+   re-sending the same data is harmless. That means we can just re-send a window of
+   recent data every time instead of maintaining a fragile pending-queue. */
+const SYNC_WINDOW_DAYS = 180;
+const SYNC_MIN_INTERVAL_MS = 60 * 1000;
+let syncInFlight = false;
+let lastSyncAttempt = 0;
+
+const syncUrlInput = document.getElementById('syncUrlInput');
+const syncTokenInput = document.getElementById('syncTokenInput');
+const syncStatusEl = document.getElementById('syncStatus');
+
+function syncWindowStart() {
+  return new Date(Date.now() - SYNC_WINDOW_DAYS * 86400000).toISOString().slice(0, 10);
+}
+
+// One row per logged set, keyed by session id + position so the same set always
+// lands on the same spreadsheet row no matter how many times it is sent.
+function buildSyncPayload() {
+  const since = syncWindowStart();
+  const rows = [];
+  sessions
+    .filter(s => s.date >= since)
+    .sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id))
+    .forEach(s => {
+      const routineName = displayRoutineName(s) || '';
+      s.exercises.forEach((ex, exIdx) => {
+        const exName = displayExerciseName(ex);
+        ex.sets.forEach((set, setIdx) => {
+          rows.push({
+            key: `${s.id}:${exIdx}:${setIdx}`,
+            date: s.date,
+            routine: routineName,
+            exercise: exName,
+            set: setIdx + 1,
+            weight: Number(set.weight) || 0,
+            reps: Number(set.reps) || 0,
+            volume: (Number(set.weight) || 0) * (Number(set.reps) || 0),
+            notes: ex.notes || '',
+          });
+        });
+      });
+    });
+
+  return {
+    token: syncConfig.token || '',
+    source: 'workout-tracker',
+    sentAt: new Date().toISOString(),
+    weights: sortedBodyWeights().map(w => ({ id: w.id, date: w.date, weight: Number(w.weight) || 0 })),
+    sets: rows,
+  };
+}
+
+function renderSyncStatus() {
+  if (!syncConfig.url) {
+    syncStatusEl.className = 'sync-status';
+    syncStatusEl.textContent = 'Not configured. Paste your Apps Script URL above to turn sync on.';
+    return;
+  }
+  if (syncInFlight) {
+    syncStatusEl.className = 'sync-status';
+    syncStatusEl.textContent = 'Syncing…';
+    return;
+  }
+  if (syncConfig.lastError) {
+    syncStatusEl.className = 'sync-status err';
+    syncStatusEl.textContent = `Last sync failed: ${syncConfig.lastError}`;
+    return;
+  }
+  if (syncConfig.lastSyncedAt) {
+    const d = new Date(syncConfig.lastSyncedAt);
+    syncStatusEl.className = 'sync-status ok';
+    syncStatusEl.textContent = `Last synced ${d.toLocaleString()}`;
+    return;
+  }
+  syncStatusEl.className = 'sync-status';
+  syncStatusEl.textContent = 'Configured — not synced yet.';
+}
+
+async function syncNow({ silent = false } = {}) {
+  if (!syncConfig.url) {
+    if (!silent) showToast('Add your Apps Script URL first');
+    return false;
+  }
+  if (syncInFlight) return false;
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    if (!silent) showToast('Offline — will sync next time you open the app');
+    return false;
+  }
+
+  syncInFlight = true;
+  lastSyncAttempt = Date.now();
+  renderSyncStatus();
+
+  try {
+    // text/plain keeps this a CORS "simple request", so the browser skips the
+    // preflight OPTIONS that Apps Script cannot answer usefully.
+    const res = await fetch(syncConfig.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(buildSyncPayload()),
+      redirect: 'follow',
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    let body = null;
+    try { body = JSON.parse(await res.text()); } catch (e) { /* non-JSON is still a delivery */ }
+    if (body && body.ok === false) throw new Error(body.error || 'rejected by script');
+
+    syncConfig.lastSyncedAt = new Date().toISOString();
+    syncConfig.lastError = null;
+    saveSyncConfig(syncConfig);
+    renderSyncStatus();
+    if (!silent) {
+      const n = body && body.counts
+        ? ` (${body.counts.weights} weigh-ins, ${body.counts.sets} sets)`
+        : '';
+      showToast(`Synced ✓${n}`);
+    }
+    return true;
+  } catch (err) {
+    console.error('Sync failed', err);
+    syncConfig.lastError = (err && err.message) || 'network error';
+    saveSyncConfig(syncConfig);
+    renderSyncStatus();
+    if (!silent) showToast(`Sync failed: ${syncConfig.lastError}`);
+    return false;
+  } finally {
+    syncInFlight = false;
+    renderSyncStatus();
+  }
+}
+
+// Fire-and-forget background sync, rate limited so saving three things in a row
+// doesn't fire three requests.
+function scheduleSync() {
+  if (!syncConfig.url) return;
+  if (Date.now() - lastSyncAttempt < SYNC_MIN_INTERVAL_MS) return;
+  syncNow({ silent: true });
+}
+
+document.getElementById('syncSaveBtn').addEventListener('click', () => {
+  const url = syncUrlInput.value.trim();
+  if (url && !/^https:\/\/script\.google\.com\//.test(url)) {
+    showToast('That should be a https://script.google.com/... URL');
+    return;
+  }
+  syncConfig.url = url;
+  syncConfig.token = syncTokenInput.value.trim();
+  syncConfig.lastError = null;
+  saveSyncConfig(syncConfig);
+  renderSyncStatus();
+  showToast(url ? 'Sync settings saved' : 'Sync turned off');
+});
+
+document.getElementById('syncNowBtn').addEventListener('click', () => syncNow());
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') scheduleSync();
+});
+
 /* ---------- CHARTS VIEW ---------- */
 const chartExerciseSelect = document.getElementById('chartExerciseSelect');
 const chartArea = document.getElementById('chartArea');
 let chartInstances = [];
 
+/* For an exercise flagged `inverted` (assisted machines), the logged weight is how
+   much the machine took OFF you, so every weight-based metric reads backwards:
+   a rising line means you needed more help. These entries relabel themselves and
+   flip "Peak" to "Best (lowest)" in that case. Reps are unaffected — more reps is
+   still more reps. */
 const CHART_METRICS = {
   volume: {
     label: 'Volume Load',
+    invertedLabel: 'Assist Volume',
     shortLabel: 'Vol',
+    betterIsLower: true,
     compute: setsToVolume,
     format: fmtNum,
   },
   avgWeight: {
     label: 'Average Weight',
+    invertedLabel: 'Average Assist',
     shortLabel: 'Avg Wt',
+    betterIsLower: true,
     compute: setsToAvgWeight,
     format: n => (Math.round(n * 10) / 10).toLocaleString(),
   },
   maxWeight: {
     label: 'Max Weight',
+    invertedLabel: 'Least Assist Used',
     shortLabel: 'Max Wt',
+    betterIsLower: true,
     compute: sets => sets.reduce((m, s) => Math.max(m, Number(s.weight) || 0), 0),
+    // The meaningful PR on an assisted machine is the LOWEST assistance you managed.
+    invertedCompute: sets => sets.reduce(
+      (m, s) => Math.min(m, Number(s.weight) || 0), Infinity),
     format: fmtNum,
   },
   maxReps: {
     label: 'Max Reps',
     shortLabel: 'Max Reps',
+    betterIsLower: false,
     compute: sets => sets.reduce((m, s) => Math.max(m, Number(s.reps) || 0), 0),
     format: n => Math.round(n).toLocaleString(),
   },
 };
+
+function metricLabel(metric, inverted) {
+  return inverted && metric.invertedLabel ? metric.invertedLabel : metric.label;
+}
+
+function metricCompute(metric, inverted) {
+  return inverted && metric.invertedCompute ? metric.invertedCompute : metric.compute;
+}
 
 function setsToVolume(sets) {
   return sets.reduce((sum, s) => sum + (Number(s.weight) || 0) * (Number(s.reps) || 0), 0);
@@ -1156,7 +1672,97 @@ function computeAxisRange(values) {
   };
 }
 
+/* Body weight gets its own chart above the exercise picker, since it isn't tied to
+   any exercise. Plots the raw daily points plus a 7-day rolling average — the raw
+   line is noisy enough (water, food, salt) that the average is the one to read. */
+let weightChartInstance = null;
+
+function renderWeightChart() {
+  const area = document.getElementById('weightChartArea');
+  if (!area) return;
+  if (weightChartInstance) { weightChartInstance.destroy(); weightChartInstance = null; }
+
+  const all = sortedBodyWeights();
+  if (all.length === 0) {
+    area.innerHTML = '';
+    return;
+  }
+
+  const avg7 = bodyWeightAverage(7);
+  const latest = all[all.length - 1];
+  const first = all[0];
+  const change = latest.weight - first.weight;
+
+  area.innerHTML = `
+    <div class="chart-card">
+      <div class="chart-card-head">
+        <div>
+          <div class="chart-card-title">Body Weight</div>
+          <div class="chart-card-note">${all.length} weigh-in${all.length !== 1 ? 's' : ''} since ${fmtDateShort(first.date)}</div>
+        </div>
+        <div class="chart-card-stats">
+          Latest <strong>${(Math.round(latest.weight * 10) / 10).toFixed(1)}</strong>
+          &middot; 7-day <strong>${avg7 ? (Math.round(avg7.avg * 10) / 10).toFixed(1) : '-'}</strong>
+          &middot; Change <strong>${change >= 0 ? '+' : ''}${(Math.round(change * 10) / 10).toFixed(1)}</strong>
+        </div>
+      </div>
+      <div class="chart-wrap-sm"><canvas id="chart-bodyweight"></canvas></div>
+    </div>
+  `;
+
+  if (typeof Chart === 'undefined') return;
+
+  // Trailing 7-day mean at each point, over whatever entries exist in that window.
+  const rolling = all.map((w, i) => {
+    const windowStart = new Date(new Date(w.date + 'T00:00:00').getTime() - 6 * 86400000)
+      .toISOString().slice(0, 10);
+    const win = all.slice(0, i + 1).filter(x => x.date >= windowStart);
+    return win.reduce((s, x) => s + x.weight, 0) / win.length;
+  });
+
+  const range = computeAxisRange(all.map(w => w.weight).concat(rolling));
+  const ctx = document.getElementById('chart-bodyweight').getContext('2d');
+  weightChartInstance = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: all.map(w => fmtDate(w.date)),
+      datasets: [
+        {
+          label: 'Daily',
+          data: all.map(w => w.weight),
+          borderColor: 'rgba(154,162,177,0.5)',
+          pointBackgroundColor: 'rgba(154,162,177,0.7)',
+          pointRadius: 2,
+          borderWidth: 1,
+          tension: 0.2,
+          fill: false,
+        },
+        {
+          label: '7-day average',
+          data: rolling,
+          borderColor: '#5b8cff',
+          backgroundColor: 'rgba(91,140,255,0.15)',
+          pointRadius: 0,
+          borderWidth: 2,
+          tension: 0.25,
+          fill: true,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: '#9aa2b1', maxRotation: 0, autoSkip: true, font: { size: 10 } }, grid: { color: '#2a2f3a' } },
+        y: { ticks: { color: '#9aa2b1', font: { size: 10 } }, grid: { color: '#2a2f3a' }, min: range.min, max: range.max },
+      },
+    },
+  });
+}
+
 function renderCharts() {
+  renderWeightChart();
   const names = allExerciseNames(sessions);
 
   if (names.length === 0) {
@@ -1202,18 +1808,26 @@ function drawChartsFor(exerciseName) {
   }
 
   const metricKeys = Object.keys(CHART_METRICS);
+  const inverted = isInvertedExerciseName(exerciseName);
 
   chartArea.innerHTML = `
     <div class="chart-session-count">${dates.length} session${dates.length !== 1 ? 's' : ''} logged</div>
-    ${metricKeys.map(key => `
+    ${inverted ? `<div class="editing-banner">Assisted exercise — the number you log is how much the machine helps, so <strong>a falling line is progress</strong>.</div>` : ''}
+    ${metricKeys.map(key => {
+      const m = CHART_METRICS[key];
+      const lower = inverted && m.betterIsLower;
+      return `
       <div class="chart-card">
         <div class="chart-card-head">
-          <div class="chart-card-title">${CHART_METRICS[key].label}</div>
-          <div class="chart-card-stats">Latest <strong id="latest-${key}">-</strong> &middot; Peak <strong id="peak-${key}">-</strong></div>
+          <div>
+            <div class="chart-card-title">${metricLabel(m, inverted)}</div>
+            ${lower ? '<div class="chart-card-note">lower is better</div>' : ''}
+          </div>
+          <div class="chart-card-stats">Latest <strong id="latest-${key}">-</strong> &middot; ${lower ? 'Best' : 'Peak'} <strong id="peak-${key}">-</strong></div>
         </div>
         <div class="chart-wrap-sm"><canvas id="chart-${key}"></canvas></div>
       </div>
-    `).join('')}
+    `; }).join('')}
   `;
 
   const chartJsAvailable = typeof Chart !== 'undefined';
@@ -1223,11 +1837,14 @@ function drawChartsFor(exerciseName) {
 
   metricKeys.forEach(key => {
     const metric = CHART_METRICS[key];
-    const points = dates.map(d => [d, metric.compute(byDate.get(d))]);
-    const values = points.map(p => p[1]);
+    const lower = inverted && metric.betterIsLower;
+    const computeFn = metricCompute(metric, inverted);
+    const points = dates.map(d => [d, computeFn(byDate.get(d))]);
+    const values = points.map(p => p[1]).map(v => (isFinite(v) ? v : 0));
 
     document.getElementById(`latest-${key}`).textContent = metric.format(values[values.length - 1]);
-    document.getElementById(`peak-${key}`).textContent = metric.format(Math.max(...values));
+    document.getElementById(`peak-${key}`).textContent =
+      metric.format(lower ? Math.min(...values) : Math.max(...values));
 
     if (!chartJsAvailable) return;
 
@@ -1239,7 +1856,7 @@ function drawChartsFor(exerciseName) {
       data: {
         labels: points.map(p => fmtDate(p[0])),
         datasets: [{
-          label: `${exerciseName} — ${metric.label}`,
+          label: `${exerciseName} — ${metricLabel(metric, inverted)}`,
           data: values,
           borderColor: '#5b8cff',
           backgroundColor: 'rgba(91,140,255,0.15)',
@@ -1274,9 +1891,25 @@ if (resumed && resumed.activeWorkout && Array.isArray(resumed.draftExercises) &&
 renderExerciseList();
 refreshExerciseDatalist();
 populateRoutineSelect();
+renderBodyWeightCard();
+syncUrlInput.value = syncConfig.url;
+syncTokenInput.value = syncConfig.token;
+renderSyncStatus();
 syncLayoutVars();
 setView('log');
 if (activeWorkout) startTimerInterval();
+
+// iOS resumes a frozen page rather than re-running JS, so re-stamp today's date
+// on the weigh-in card too and take the chance to push anything unsynced.
+window.addEventListener('pageshow', () => {
+  if (bwDateInput.value < todayStr()) bwDateInput.value = todayStr();
+  renderBodyWeightCard();
+  scheduleSync();
+});
+
+// First sync of the session. Deliberately silent — a failed background sync
+// shouldn't greet you with an error toast every time you open the app.
+scheduleSync();
 
 /* ---------- Service worker registration ---------- */
 if ('serviceWorker' in navigator) {

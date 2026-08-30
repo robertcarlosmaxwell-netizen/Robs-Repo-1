@@ -340,6 +340,100 @@
   .toast.show{opacity:1; transform:translateX(-50%) translateY(0);}
 
   /* Sets table (Set / Prev / Weight / Reps) */
+  /* Daily weigh-in card on the Pre-Workout screen */
+  .bw-card .bw-entry-row{
+    display:flex;
+    gap:8px;
+    margin-top:8px;
+  }
+  .bw-card .bw-entry-row input{flex:1; min-width:0;}
+  .bw-card .bw-entry-row .btn{flex:0 0 auto; width:auto; padding:0 20px;}
+  .bw-stats{
+    margin-top:10px;
+    font-size:12px;
+    color:var(--text-dim);
+    line-height:1.5;
+  }
+  .bw-stats .bw-avg{color:var(--accent); font-weight:700;}
+  .bw-stats .bw-recent{
+    margin-top:6px;
+    display:flex;
+    flex-wrap:wrap;
+    gap:6px;
+  }
+  .bw-stats .bw-chip{
+    background:var(--bg-elev);
+    border:1px solid var(--border);
+    border-radius:6px;
+    padding:2px 7px;
+    font-size:11px;
+    white-space:nowrap;
+  }
+  .bw-stats .bw-chip.today{border-color:var(--accent-dim); color:var(--text);}
+
+  /* Cloud sync settings */
+  .sync-hint{
+    font-size:11px;
+    color:var(--text-dim);
+    line-height:1.5;
+    margin:2px 0 10px;
+  }
+  .sync-status{
+    margin-top:10px;
+    font-size:12px;
+    color:var(--text-dim);
+    line-height:1.5;
+  }
+  .sync-status.ok{color:var(--good);}
+  .sync-status.err{color:var(--danger);}
+
+  /* Session editor on the History tab */
+  .edit-row{
+    display:flex;
+    align-items:center;
+    gap:8px;
+    margin-bottom:8px;
+  }
+  .edit-row .set-idx{
+    width:22px; flex-shrink:0; text-align:center;
+    color:var(--text-dim); font-size:12px; font-weight:700;
+  }
+  .edit-row input{flex:1; min-width:0;}
+  .edit-row .remove-set{
+    background:none; border:none; color:var(--text-dim);
+    font-size:18px; width:30px; flex-shrink:0;
+  }
+  .edit-ex-name{
+    font-weight:700; font-size:14px;
+    margin:12px 0 8px;
+    display:flex; justify-content:space-between; align-items:center; gap:8px;
+  }
+  .edit-ex-name .btn{flex:0 0 auto; width:auto;}
+  .editing-banner{
+    background:var(--accent-dim);
+    color:var(--text);
+    border-radius:8px;
+    padding:8px 10px;
+    font-size:12px;
+    margin-bottom:10px;
+  }
+  .inverted-tag{
+    display:inline-block;
+    background:var(--accent-dim);
+    color:var(--text);
+    border-radius:5px;
+    padding:1px 6px;
+    font-size:10px;
+    font-weight:700;
+    margin-left:6px;
+    vertical-align:middle;
+  }
+  .chart-card-note{
+    font-size:11px;
+    color:var(--text-dim);
+    margin-top:2px;
+  }
+
   /* "What you noted last time" banner, above the set-table column headers */
   .prev-note{
     display:flex;
@@ -508,6 +602,18 @@
 
       <!-- PRE-WORKOUT SCREEN -->
       <div id="preWorkoutScreen">
+        <!-- Daily weigh-in. Lives here because it's the first thing you see when the
+             app opens, so it works on rest days too — not just gym days. -->
+        <div class="card bw-card">
+          <label for="bwWeight">Daily weigh-in</label>
+          <input type="date" id="bwDate" autocomplete="off">
+          <div class="bw-entry-row">
+            <input type="number" id="bwWeight" inputmode="decimal" step="0.1" min="0" placeholder="Weight (lb)">
+            <button class="btn btn-primary" id="bwSaveBtn">Log</button>
+          </div>
+          <div class="bw-stats" id="bwStats"></div>
+        </div>
+
         <div class="card">
           <label for="routineSelect">Routine (optional)</label>
           <select id="routineSelect">
@@ -579,14 +685,31 @@
           <button class="btn btn-secondary btn-sm" id="exportJsonBtn">Download Backup (JSON)</button>
           <button class="btn btn-secondary btn-sm" id="exportCsvBtn">Download CSV</button>
         </div>
+        <button class="btn btn-secondary btn-sm btn-block" id="exportWeightCsvBtn" style="margin-top:8px;">Download Weight CSV</button>
         <button class="btn btn-secondary btn-sm btn-block" id="importJsonBtn" style="margin-top:8px;">Restore from Backup</button>
         <input type="file" id="importFileInput" accept="application/json,.json" style="display:none;">
       </div>
+
+      <!-- Cloud sync. The URL is a write capability for the spreadsheet, so it's
+           entered here on the device and never lives in the repo. -->
+      <div class="card">
+        <label>Cloud Sync (Google Sheet)</label>
+        <div class="sync-hint">Pushes weigh-ins and workouts to your Health Hub sheet. Runs when the app opens and after you save — iOS won't let it run in the background.</div>
+        <input type="url" id="syncUrlInput" placeholder="Apps Script web app URL" autocomplete="off" spellcheck="false">
+        <input type="text" id="syncTokenInput" placeholder="Shared secret" autocomplete="off" spellcheck="false" style="margin-top:8px;">
+        <div class="row" style="margin-top:10px;">
+          <button class="btn btn-secondary btn-sm" id="syncSaveBtn">Save Settings</button>
+          <button class="btn btn-primary btn-sm" id="syncNowBtn">Sync Now</button>
+        </div>
+        <div class="sync-status" id="syncStatus"></div>
+      </div>
+
       <div id="historyList"></div>
     </section>
 
     <!-- CHARTS VIEW -->
     <section id="view-charts" class="view">
+      <div id="weightChartArea"></div>
       <div class="card">
         <label for="chartExerciseSelect">Exercise</label>
         <select id="chartExerciseSelect"></select>
