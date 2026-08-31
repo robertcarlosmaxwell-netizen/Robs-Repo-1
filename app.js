@@ -126,12 +126,76 @@ function normalizeRoutine(r) {
 // `inverted` marks exercises where a HIGHER logged number means you were WEAKER —
 // assisted pull-up/chin-up machines, where the number is how much weight the machine
 // takes off you. Without this the charts read exactly backwards for those lifts.
+// `kind` is 'strength' (weight x reps) or 'cardio' (time / distance / incline).
+// Anything saved before cardio existed has no kind and defaults to strength.
 function normalizeExerciseLibrary(list) {
   return (list || []).map(e => (
     typeof e === 'string'
-      ? { id: uid(), name: e, inverted: false }
-      : { ...e, inverted: !!e.inverted }
+      ? { id: uid(), name: e, inverted: false, kind: 'strength' }
+      : { ...e, inverted: !!e.inverted, kind: e.kind === 'cardio' ? 'cardio' : 'strength' }
   ));
+}
+
+/* ---------- Cardio helpers ----------
+   A cardio bout is { minutes, distanceMi, inclinePct }. Speed and pace are always
+   derived rather than stored, so they can never drift out of sync with the inputs. */
+function isCardioExerciseName(name) {
+  const entry = findExerciseByName(name);
+  return !!(entry && entry.kind === 'cardio');
+}
+
+// A logged exercise knows its own kind, so history stays readable even if the
+// library entry is later deleted or switched.
+function exerciseIsCardio(ex) {
+  if (ex && ex.kind) return ex.kind === 'cardio';
+  return isCardioExerciseName(ex && ex.name);
+}
+
+function cardioMinutes(sets) {
+  return (sets || []).reduce((sum, s) => sum + (Number(s.minutes) || 0), 0);
+}
+
+function cardioDistance(sets) {
+  return (sets || []).reduce((sum, s) => sum + (Number(s.distanceMi) || 0), 0);
+}
+
+function cardioSpeedMph(sets) {
+  const min = cardioMinutes(sets);
+  if (!min) return 0;
+  return cardioDistance(sets) / (min / 60);
+}
+
+// Weighted by distance so a long slow bout doesn't get averaged against a sprint.
+function cardioAvgIncline(sets) {
+  const list = (sets || []).filter(s => Number(s.minutes) > 0);
+  if (!list.length) return 0;
+  const totalMin = list.reduce((sum, s) => sum + Number(s.minutes), 0);
+  return list.reduce((sum, s) => sum + (Number(s.inclinePct) || 0) * Number(s.minutes), 0) / totalMin;
+}
+
+function fmtPace(minutesPerMile) {
+  if (!isFinite(minutesPerMile) || minutesPerMile <= 0) return '—';
+  const m = Math.floor(minutesPerMile);
+  const s = Math.round((minutesPerMile - m) * 60);
+  return s === 60 ? `${m + 1}:00` : `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function cardioPace(sets) {
+  const dist = cardioDistance(sets);
+  return dist > 0 ? cardioMinutes(sets) / dist : 0;
+}
+
+// One-line summary used on the PREV banner, history cards and the workout screen.
+function cardioSummary(sets) {
+  const min = cardioMinutes(sets);
+  if (!min) return '';
+  const dist = cardioDistance(sets);
+  const incline = cardioAvgIncline(sets);
+  const bits = [`${Math.round(min * 10) / 10} min`];
+  if (dist > 0) bits.push(`${(Math.round(dist * 100) / 100).toFixed(2)} mi`);
+  if (incline > 0) bits.push(`${Math.round(incline * 10) / 10}% incline`);
+  if (dist > 0) bits.push(`${fmtPace(cardioPace(sets))}/mi`);
+  return bits.join(' · ');
 }
 
 function uid() {
@@ -145,13 +209,23 @@ function todayStr() {
   return local.toISOString().slice(0, 10);
 }
 
-/* ---------- Volume calculations ---------- */
+/* ---------- Volume calculations ----------
+   Volume load is weight x reps. Cardio has neither, so it contributes zero and is
+   excluded from session totals — otherwise a treadmill warm-up would silently
+   dilute the number that's supposed to track lifting. */
 function exerciseVolume(exercise) {
+  if (exerciseIsCardio(exercise)) return 0;
   return setsToVolume(exercise.sets);
 }
 
 function sessionVolume(session) {
   return session.exercises.reduce((sum, ex) => sum + exerciseVolume(ex), 0);
+}
+
+// Total treadmill/bike time in a session, for the history card subtitle.
+function sessionCardioMinutes(session) {
+  return session.exercises.reduce(
+    (sum, ex) => sum + (exerciseIsCardio(ex) ? cardioMinutes(ex.sets) : 0), 0);
 }
 
 /* ---------- Exercise identity (library IDs) ---------- */
@@ -383,7 +457,7 @@ const titles = {
   routines: ['Routines', 'Build & manage your routines'],
   exercises: ['Exercises', 'Your exercise library'],
   history: ['History', 'Past workout sessions'],
-  charts: ['Progress', 'Volume load over time'],
+  charts: ['Progress', 'Body weight and strength trends'],
 };
 
 function setView(name) {
@@ -567,8 +641,145 @@ function escapeHtml(str) {
 
 let draftExercises = []; // [{ id, name, sets: [{weight, reps}], notes }]
 
+function newCardioBout() {
+  return { minutes: '', distanceMi: '', inclinePct: '' };
+}
+
 function newDraftExercise(name = '') {
-  return { id: uid(), name, sets: [{ weight: '', reps: '' }], notes: '' };
+  const cardio = isCardioExerciseName(name);
+  return {
+    id: uid(),
+    name,
+    kind: cardio ? 'cardio' : 'strength',
+    sets: [cardio ? newCardioBout() : { weight: '', reps: '' }],
+    notes: '',
+  };
+}
+
+/* Weight x reps rows — the original layout. */
+function buildStrengthRows(block, ex, perf) {
+  const setsHeader = document.createElement('div');
+  setsHeader.className = 'sets-header';
+  setsHeader.innerHTML = `
+    <span class="set-idx">SET</span>
+    <span class="col-prev" data-role="prev-header">${perf ? `PREV (${fmtDateShort(perf.date)})` : 'PREV'}</span>
+    <span class="col-weight">WEIGHT</span>
+    <span class="col-reps">REPS</span>
+    <span class="col-remove"></span>
+  `;
+  block.appendChild(setsHeader);
+
+  const setsWrap = document.createElement('div');
+  setsWrap.className = 'sets-wrap';
+  ex.sets.forEach((set, si) => {
+    const row = document.createElement('div');
+    row.className = 'set-row';
+    const prevSet = perf && perf.sets[si];
+    const prevText = prevSet ? `${prevSet.weight}×${prevSet.reps}` : '—';
+    row.innerHTML = `
+      <span class="set-idx">${si + 1}</span>
+      <span class="prev-val" data-role="prev-val">${prevText}</span>
+      <input type="number" inputmode="decimal" placeholder="Weight" min="0" step="any" value="${set.weight}" data-role="weight">
+      <input type="number" inputmode="numeric" placeholder="Reps" min="0" step="1" value="${set.reps}" data-role="reps">
+      <button class="remove-set" data-role="remove-set" title="Remove set">–</button>
+    `;
+    row.querySelector('[data-role="weight"]').addEventListener('input', (e) => set.weight = e.target.value);
+    row.querySelector('[data-role="reps"]').addEventListener('input', (e) => set.reps = e.target.value);
+    row.querySelector('[data-role="remove-set"]').addEventListener('click', () => {
+      ex.sets = ex.sets.filter((_, i) => i !== si);
+      if (ex.sets.length === 0) ex.sets.push({ weight: '', reps: '' });
+      renderExerciseList();
+    });
+    setsWrap.appendChild(row);
+  });
+  block.appendChild(setsWrap);
+
+  const addSetBtn = document.createElement('button');
+  addSetBtn.className = 'add-set-btn';
+  addSetBtn.textContent = '+ Add Set';
+  addSetBtn.addEventListener('click', () => {
+    ex.sets.push({ weight: '', reps: '' });
+    renderExerciseList();
+  });
+  block.appendChild(addSetBtn);
+}
+
+/* Time / distance / incline rows. Speed and pace are shown live under the inputs
+   rather than being fields of their own — one less thing to type on a treadmill,
+   and they can never disagree with the numbers they're derived from. */
+function buildCardioRows(block, ex, perf) {
+  // Cardio has no per-set PREV column, so last time's numbers go on one line.
+  const prevLine = document.createElement('div');
+  prevLine.className = 'cardio-prev';
+  prevLine.dataset.role = 'cardio-prev';
+  block.appendChild(prevLine);
+  paintCardioPrev(block, perf);
+
+  const header = document.createElement('div');
+  header.className = 'sets-header cardio-header';
+  header.innerHTML = `
+    <span class="set-idx">#</span>
+    <span class="col-min">MIN</span>
+    <span class="col-dist">DIST (MI)</span>
+    <span class="col-incline">INCLINE %</span>
+    <span class="col-remove"></span>
+  `;
+  block.appendChild(header);
+
+  const wrap = document.createElement('div');
+  wrap.className = 'sets-wrap';
+
+  const repaintDerived = () => {
+    const el = block.querySelector('[data-role="cardio-derived"]');
+    if (!el) return;
+    const min = cardioMinutes(ex.sets);
+    const dist = cardioDistance(ex.sets);
+    if (!min) { el.textContent = ''; return; }
+    const parts = [`${Math.round(min * 10) / 10} min total`];
+    if (dist > 0) {
+      parts.push(`${(Math.round(cardioSpeedMph(ex.sets) * 10) / 10).toFixed(1)} mph`);
+      parts.push(`${fmtPace(cardioPace(ex.sets))}/mi`);
+    }
+    el.textContent = parts.join('  ·  ');
+  };
+
+  ex.sets.forEach((bout, si) => {
+    const row = document.createElement('div');
+    row.className = 'set-row cardio-row';
+    row.innerHTML = `
+      <span class="set-idx">${si + 1}</span>
+      <input type="number" inputmode="decimal" placeholder="min" min="0" step="any" value="${bout.minutes ?? ''}" data-role="c-min">
+      <input type="number" inputmode="decimal" placeholder="mi" min="0" step="any" value="${bout.distanceMi ?? ''}" data-role="c-dist">
+      <input type="number" inputmode="decimal" placeholder="%" min="0" step="any" value="${bout.inclinePct ?? ''}" data-role="c-incline">
+      <button class="remove-set" data-role="remove-set" title="Remove">–</button>
+    `;
+    row.querySelector('[data-role="c-min"]').addEventListener('input', (e) => { bout.minutes = e.target.value; repaintDerived(); });
+    row.querySelector('[data-role="c-dist"]').addEventListener('input', (e) => { bout.distanceMi = e.target.value; repaintDerived(); });
+    row.querySelector('[data-role="c-incline"]').addEventListener('input', (e) => { bout.inclinePct = e.target.value; });
+    row.querySelector('[data-role="remove-set"]').addEventListener('click', () => {
+      ex.sets = ex.sets.filter((_, i) => i !== si);
+      if (ex.sets.length === 0) ex.sets.push(newCardioBout());
+      renderExerciseList();
+    });
+    wrap.appendChild(row);
+  });
+  block.appendChild(wrap);
+
+  const derived = document.createElement('div');
+  derived.className = 'cardio-derived';
+  derived.dataset.role = 'cardio-derived';
+  block.appendChild(derived);
+
+  const addBtn = document.createElement('button');
+  addBtn.className = 'add-set-btn';
+  addBtn.textContent = '+ Add Interval';
+  addBtn.addEventListener('click', () => {
+    ex.sets.push(newCardioBout());
+    renderExerciseList();
+  });
+  block.appendChild(addBtn);
+
+  repaintDerived();
 }
 
 // Show/hide + fill the "note from last time" banner for one exercise block.
@@ -591,6 +802,15 @@ function updateBlockPrevNote(block, perf) {
 
 // Refresh the "PREV" header + per-set previous values for one exercise block
 // without rebuilding the DOM (keeps focus/cursor position while typing the name).
+function paintCardioPrev(block, perf) {
+  const el = block.querySelector('[data-role="cardio-prev"]');
+  if (!el) return;
+  const summary = perf ? cardioSummary(perf.sets) : '';
+  if (!summary) { el.hidden = true; return; }
+  el.hidden = false;
+  el.innerHTML = `<span class="cardio-prev-date">PREV ${escapeHtml(fmtDateShort(perf.date))}</span> ${escapeHtml(summary)}`;
+}
+
 function updateBlockPrevData(block, ex) {
   const perf = lastPerformanceFor(ex.name);
   const headerPrevEl = block.querySelector('[data-role="prev-header"]');
@@ -599,6 +819,7 @@ function updateBlockPrevData(block, ex) {
     const s = perf && perf.sets[si];
     el.textContent = s ? `${s.weight}×${s.reps}` : '—';
   });
+  paintCardioPrev(block, perf);
   updateBlockPrevNote(block, perf);
 }
 
@@ -631,50 +852,11 @@ function renderExerciseList() {
     block.appendChild(prevNote);
     updateBlockPrevNote(block, perf);
 
-    const setsHeader = document.createElement('div');
-    setsHeader.className = 'sets-header';
-    setsHeader.innerHTML = `
-      <span class="set-idx">SET</span>
-      <span class="col-prev" data-role="prev-header">${perf ? `PREV (${fmtDateShort(perf.date)})` : 'PREV'}</span>
-      <span class="col-weight">WEIGHT</span>
-      <span class="col-reps">REPS</span>
-      <span class="col-remove"></span>
-    `;
-    block.appendChild(setsHeader);
+    const isCardio = exerciseIsCardio({ name: ex.name, kind: ex.kind });
+    block.dataset.kind = isCardio ? 'cardio' : 'strength';
 
-    const setsWrap = document.createElement('div');
-    setsWrap.className = 'sets-wrap';
-    ex.sets.forEach((set, si) => {
-      const row = document.createElement('div');
-      row.className = 'set-row';
-      const prevSet = perf && perf.sets[si];
-      const prevText = prevSet ? `${prevSet.weight}×${prevSet.reps}` : '—';
-      row.innerHTML = `
-        <span class="set-idx">${si + 1}</span>
-        <span class="prev-val" data-role="prev-val">${prevText}</span>
-        <input type="number" inputmode="decimal" placeholder="Weight" min="0" step="any" value="${set.weight}" data-role="weight">
-        <input type="number" inputmode="numeric" placeholder="Reps" min="0" step="1" value="${set.reps}" data-role="reps">
-        <button class="remove-set" data-role="remove-set" title="Remove set">–</button>
-      `;
-      row.querySelector('[data-role="weight"]').addEventListener('input', (e) => set.weight = e.target.value);
-      row.querySelector('[data-role="reps"]').addEventListener('input', (e) => set.reps = e.target.value);
-      row.querySelector('[data-role="remove-set"]').addEventListener('click', () => {
-        ex.sets = ex.sets.filter((_, i) => i !== si);
-        if (ex.sets.length === 0) ex.sets.push({ weight: '', reps: '' });
-        renderExerciseList();
-      });
-      setsWrap.appendChild(row);
-    });
-    block.appendChild(setsWrap);
-
-    const addSetBtn = document.createElement('button');
-    addSetBtn.className = 'add-set-btn';
-    addSetBtn.textContent = '+ Add Set';
-    addSetBtn.addEventListener('click', () => {
-      ex.sets.push({ weight: '', reps: '' });
-      renderExerciseList();
-    });
-    block.appendChild(addSetBtn);
+    if (isCardio) buildCardioRows(block, ex, perf);
+    else buildStrengthRows(block, ex, perf);
 
     const notesWrap = document.createElement('div');
     notesWrap.className = 'notes-row';
@@ -684,6 +866,23 @@ function renderExerciseList() {
 
     head.querySelector('[data-role="ex-name"]').addEventListener('input', (e) => {
       ex.name = e.target.value;
+      // Typing the name of a cardio exercise has to swap the whole row layout —
+      // weight/reps and time/distance are different fields. Only rebuild on an
+      // actual kind change, and put the cursor back where it was afterwards.
+      const nowKind = isCardioExerciseName(ex.name) ? 'cardio' : 'strength';
+      if (nowKind !== block.dataset.kind) {
+        ex.kind = nowKind;
+        ex.sets = [nowKind === 'cardio' ? newCardioBout() : { weight: '', reps: '' }];
+        const caret = e.target.selectionStart;
+        renderExerciseList();
+        const again = [...exerciseListEl.querySelectorAll('[data-role="ex-name"]')]
+          .find(inp => inp.value === ex.name);
+        if (again) {
+          again.focus();
+          try { again.setSelectionRange(caret, caret); } catch (err) { /* not all inputs support it */ }
+        }
+        return;
+      }
       updateBlockPrevData(block, ex);
     });
     head.querySelector('[data-role="remove-ex"]').addEventListener('click', () => {
@@ -776,6 +975,9 @@ document.getElementById('startWorkoutBtn').addEventListener('click', () => {
   draftExercises = routine
     ? routine.exercises.map(re => {
         const de = newDraftExercise(re.name);
+        // A routine's "sets" count is a strength idea; cardio gets a single bout
+        // unless you add intervals during the workout.
+        if (de.kind === 'cardio') return de;
         const count = Math.max(1, Number(re.sets) || 1);
         de.sets = Array.from({ length: count }, () => ({ weight: '', reps: '' }));
         return de;
@@ -800,14 +1002,24 @@ endWorkoutBtn.addEventListener('click', () => {
   const durationSeconds = Math.max(0, Math.floor((Date.now() - activeWorkout.startTime) / 1000));
   stopTimerInterval();
 
+  // Cardio bouts only need a duration to be worth keeping — distance and incline
+  // are optional, since not every machine reports them.
   const cleanExercises = draftExercises
-    .map(ex => ({
-      name: (ex.name || '').trim(),
-      notes: (ex.notes || '').trim(),
-      sets: ex.sets
-        .filter(s => s.weight !== '' && s.reps !== '' && !isNaN(Number(s.weight)) && !isNaN(Number(s.reps)))
-        .map(s => ({ weight: Number(s.weight), reps: Number(s.reps) })),
-    }))
+    .map(ex => {
+      const kind = exerciseIsCardio({ name: ex.name, kind: ex.kind }) ? 'cardio' : 'strength';
+      const sets = kind === 'cardio'
+        ? ex.sets
+            .filter(s => s.minutes !== '' && s.minutes != null && !isNaN(Number(s.minutes)) && Number(s.minutes) > 0)
+            .map(s => ({
+              minutes: Number(s.minutes),
+              distanceMi: s.distanceMi === '' || s.distanceMi == null ? 0 : Number(s.distanceMi) || 0,
+              inclinePct: s.inclinePct === '' || s.inclinePct == null ? 0 : Number(s.inclinePct) || 0,
+            }))
+        : ex.sets
+            .filter(s => s.weight !== '' && s.reps !== '' && !isNaN(Number(s.weight)) && !isNaN(Number(s.reps)))
+            .map(s => ({ weight: Number(s.weight), reps: Number(s.reps) }));
+      return { name: (ex.name || '').trim(), kind, notes: (ex.notes || '').trim(), sets };
+    })
     .filter(ex => ex.name && ex.sets.length > 0);
 
   if (cleanExercises.length > 0) {
@@ -996,20 +1208,33 @@ function renderExerciseLibrary() {
     row.className = 'session-card';
     row.innerHTML = `
       <div class="session-head" style="cursor:default;">
-        <div class="date" style="font-size:15px;">${escapeHtml(entry.name)}${entry.inverted ? '<span class="inverted-tag">ASSIST</span>' : ''}</div>
+        <div class="date" style="font-size:15px;">${escapeHtml(entry.name)}${entry.inverted ? '<span class="inverted-tag">ASSIST</span>' : ''}${entry.kind === 'cardio' ? '<span class="cardio-tag">CARDIO</span>' : ''}</div>
         <div class="row" style="flex:0 0 auto; gap:8px;">
           <button class="btn btn-secondary btn-sm" data-role="rename-ex">Rename</button>
           <button class="btn btn-danger btn-sm" data-role="delete-ex">Delete</button>
         </div>
       </div>
       <div class="session-body open" style="padding-top:10px;">
-        <label style="display:flex; align-items:center; gap:10px; font-size:12px; color:var(--text-dim); margin:0;">
-          <input type="checkbox" data-role="invert-ex" ${entry.inverted ? 'checked' : ''}
-            style="width:auto; min-height:0; margin:0; flex:0 0 auto;">
+        <label class="ex-opt">
+          <input type="checkbox" data-role="cardio-ex" ${entry.kind === 'cardio' ? 'checked' : ''}>
+          <span><strong>Cardio</strong> — log time, distance and incline instead of weight and reps</span>
+        </label>
+        <label class="ex-opt" data-role="invert-wrap" ${entry.kind === 'cardio' ? 'hidden' : ''}>
+          <input type="checkbox" data-role="invert-ex" ${entry.inverted ? 'checked' : ''}>
           <span>Weight logged is <strong>assistance</strong> — lower is better (e.g. assisted chin-ups)</span>
         </label>
       </div>
     `;
+    row.querySelector('[data-role="cardio-ex"]').addEventListener('change', (e) => {
+      entry.kind = e.target.checked ? 'cardio' : 'strength';
+      // "Assistance" is a weight concept; it means nothing for a treadmill.
+      if (entry.kind === 'cardio') entry.inverted = false;
+      saveExerciseLibrary(exerciseLibrary);
+      renderExerciseLibrary();
+      showToast(entry.kind === 'cardio'
+        ? 'Now logged as time and distance'
+        : 'Back to weight and reps');
+    });
     row.querySelector('[data-role="invert-ex"]').addEventListener('change', (e) => {
       entry.inverted = e.target.checked;
       saveExerciseLibrary(exerciseLibrary);
@@ -1103,18 +1328,26 @@ function renderHistory() {
       <div class="session-head" data-role="head">
         <div>
           <div class="date">${fmtDate(session.date)}</div>
-          <div class="meta">${rName ? escapeHtml(rName) + ' · ' : ''}${session.exercises.length} exercise${session.exercises.length !== 1 ? 's' : ''}${session.durationSeconds != null ? ' · ' + formatDuration(session.durationSeconds) : ''}</div>
+          <div class="meta">${rName ? escapeHtml(rName) + ' · ' : ''}${session.exercises.length} exercise${session.exercises.length !== 1 ? 's' : ''}${session.durationSeconds != null ? ' · ' + formatDuration(session.durationSeconds) : ''}${sessionCardioMinutes(session) > 0 ? ' · ' + Math.round(sessionCardioMinutes(session)) + ' min cardio' : ''}</div>
         </div>
         <div class="vol">${fmtNum(vol)}<div class="meta">total vol</div></div>
       </div>
       <div class="session-body ${isOpen ? 'open' : ''}" data-role="body">
-        ${session.exercises.map(ex => `
+        ${session.exercises.map(ex => {
+          const cardio = exerciseIsCardio(ex);
+          const right = cardio
+            ? `${Math.round(cardioMinutes(ex.sets) * 10) / 10} min`
+            : `${fmtNum(exerciseVolume(ex))} vol`;
+          const detail = cardio
+            ? escapeHtml(cardioSummary(ex.sets))
+            : ex.sets.map(s => `${s.weight}×${s.reps}`).join('  ·  ');
+          return `
           <div class="ex-row">
-            <div class="ex-name"><span>${escapeHtml(displayExerciseName(ex))}</span><span class="vol">${fmtNum(exerciseVolume(ex))} vol</span></div>
-            <div class="sets">${ex.sets.map(s => `${s.weight}×${s.reps}`).join('  ·  ')}</div>
+            <div class="ex-name"><span>${escapeHtml(displayExerciseName(ex))}${cardio ? '<span class="cardio-tag">CARDIO</span>' : ''}</span><span class="vol">${right}</span></div>
+            <div class="sets">${detail}</div>
             ${ex.notes ? `<div class="ex-notes">📝 ${escapeHtml(ex.notes)}</div>` : ''}
           </div>
-        `).join('')}
+        `; }).join('')}
         <div class="session-actions" style="justify-content:space-between;">
           <button class="btn btn-secondary btn-sm" data-role="edit">Edit</button>
           <button class="btn btn-danger btn-sm" data-role="delete">Delete Session</button>
@@ -1197,17 +1430,32 @@ function renderSessionEditorCard(session) {
       });
       wrap.appendChild(nameRow);
 
+      const cardio = exerciseIsCardio(ex);
       ex.sets.forEach((set, setIdx) => {
         const row = document.createElement('div');
         row.className = 'edit-row';
-        row.innerHTML = `
+        row.innerHTML = cardio
+          ? `
+          <span class="set-idx">${setIdx + 1}</span>
+          <input type="number" inputmode="decimal" step="any" min="0" value="${set.minutes ?? ''}" data-role="e-min" placeholder="Min">
+          <input type="number" inputmode="decimal" step="any" min="0" value="${set.distanceMi ?? ''}" data-role="e-dist" placeholder="Miles">
+          <input type="number" inputmode="decimal" step="any" min="0" value="${set.inclinePct ?? ''}" data-role="e-incline" placeholder="Incline %">
+          <button class="remove-set" data-role="e-rm" title="Remove">–</button>
+        `
+          : `
           <span class="set-idx">${setIdx + 1}</span>
           <input type="number" inputmode="decimal" step="any" min="0" value="${set.weight}" data-role="e-weight" placeholder="Weight">
           <input type="number" inputmode="numeric" step="1" min="0" value="${set.reps}" data-role="e-reps" placeholder="Reps">
           <button class="remove-set" data-role="e-rm" title="Remove set">–</button>
         `;
-        row.querySelector('[data-role="e-weight"]').addEventListener('input', (e) => { set.weight = e.target.value; });
-        row.querySelector('[data-role="e-reps"]').addEventListener('input', (e) => { set.reps = e.target.value; });
+        if (cardio) {
+          row.querySelector('[data-role="e-min"]').addEventListener('input', (e) => { set.minutes = e.target.value; });
+          row.querySelector('[data-role="e-dist"]').addEventListener('input', (e) => { set.distanceMi = e.target.value; });
+          row.querySelector('[data-role="e-incline"]').addEventListener('input', (e) => { set.inclinePct = e.target.value; });
+        } else {
+          row.querySelector('[data-role="e-weight"]').addEventListener('input', (e) => { set.weight = e.target.value; });
+          row.querySelector('[data-role="e-reps"]').addEventListener('input', (e) => { set.reps = e.target.value; });
+        }
         row.querySelector('[data-role="e-rm"]').addEventListener('click', () => {
           ex.sets.splice(setIdx, 1);
           if (ex.sets.length === 0) draft.exercises.splice(exIdx, 1);
@@ -1241,9 +1489,17 @@ function renderSessionEditorCard(session) {
         .map(ex => ({
           ...ex,
           notes: (ex.notes || '').trim(),
-          sets: ex.sets
-            .filter(s => s.weight !== '' && s.reps !== '' && !isNaN(Number(s.weight)) && !isNaN(Number(s.reps)))
-            .map(s => ({ weight: Number(s.weight), reps: Number(s.reps) })),
+          sets: exerciseIsCardio(ex)
+            ? ex.sets
+                .filter(s => s.minutes !== '' && s.minutes != null && !isNaN(Number(s.minutes)) && Number(s.minutes) > 0)
+                .map(s => ({
+                  minutes: Number(s.minutes),
+                  distanceMi: s.distanceMi === '' || s.distanceMi == null ? 0 : Number(s.distanceMi) || 0,
+                  inclinePct: s.inclinePct === '' || s.inclinePct == null ? 0 : Number(s.inclinePct) || 0,
+                }))
+            : ex.sets
+                .filter(s => s.weight !== '' && s.reps !== '' && !isNaN(Number(s.weight)) && !isNaN(Number(s.reps)))
+                .map(s => ({ weight: Number(s.weight), reps: Number(s.reps) })),
         }))
         .filter(ex => ex.sets.length > 0);
 
@@ -1288,12 +1544,15 @@ function csvEscape(val) {
   return /[",\n]/.test(str) ? '"' + str.replace(/"/g, '""') + '"' : str;
 }
 
+// Strength sets only — cardio has its own file, because forcing both into one
+// table means half the columns are always blank.
 function buildCsv() {
   const rows = [['Date', 'Routine', 'Exercise', 'Set', 'Weight', 'Reps', 'Volume', 'Notes']];
   const sorted = [...sessions].sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id));
   sorted.forEach(s => {
     const routineName = displayRoutineName(s) || '';
     s.exercises.forEach(ex => {
+      if (exerciseIsCardio(ex)) return;
       const exName = displayExerciseName(ex);
       ex.sets.forEach((set, i) => {
         rows.push([
@@ -1304,6 +1563,34 @@ function buildCsv() {
           set.weight,
           set.reps,
           (Number(set.weight) || 0) * (Number(set.reps) || 0),
+          ex.notes || '',
+        ]);
+      });
+    });
+  });
+  return rows.map(r => r.map(csvEscape).join(',')).join('\r\n');
+}
+
+function buildCardioCsv() {
+  const rows = [['Date', 'Routine', 'Exercise', 'Interval', 'Minutes', 'Distance (mi)', 'Incline %', 'Avg Speed (mph)', 'Pace (min/mi)', 'Notes']];
+  const sorted = [...sessions].sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id));
+  sorted.forEach(s => {
+    const routineName = displayRoutineName(s) || '';
+    s.exercises.forEach(ex => {
+      if (!exerciseIsCardio(ex)) return;
+      const exName = displayExerciseName(ex);
+      ex.sets.forEach((bout, i) => {
+        const one = [bout];
+        rows.push([
+          s.date,
+          routineName,
+          exName,
+          i + 1,
+          bout.minutes,
+          bout.distanceMi,
+          bout.inclinePct,
+          Math.round(cardioSpeedMph(one) * 100) / 100,
+          fmtPace(cardioPace(one)),
           ex.notes || '',
         ]);
       });
@@ -1339,6 +1626,13 @@ function buildWeightCsv() {
   sortedBodyWeights().forEach(w => rows.push([w.date, w.weight]));
   return rows.map(r => r.map(csvEscape).join(',')).join('\r\n');
 }
+
+document.getElementById('exportCardioCsvBtn').addEventListener('click', () => {
+  const hasCardio = sessions.some(s => s.exercises.some(exerciseIsCardio));
+  if (!hasCardio) { showToast('No cardio logged yet'); return; }
+  triggerDownload(`cardio-data-${todayStr()}.csv`, buildCardioCsv(), 'text/csv');
+  showToast('Cardio CSV downloaded');
+});
 
 document.getElementById('exportWeightCsvBtn').addEventListener('click', () => {
   if (bodyWeights.length === 0) { showToast('No weigh-ins logged yet'); return; }
@@ -1440,6 +1734,7 @@ function syncWindowStart() {
 function buildSyncPayload() {
   const since = syncWindowStart();
   const rows = [];
+  const cardioRows = [];
   sessions
     .filter(s => s.date >= since)
     .sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id))
@@ -1447,18 +1742,39 @@ function buildSyncPayload() {
       const routineName = displayRoutineName(s) || '';
       s.exercises.forEach((ex, exIdx) => {
         const exName = displayExerciseName(ex);
+        const cardio = exerciseIsCardio(ex);
         ex.sets.forEach((set, setIdx) => {
-          rows.push({
-            key: `${s.id}:${exIdx}:${setIdx}`,
-            date: s.date,
-            routine: routineName,
-            exercise: exName,
-            set: setIdx + 1,
-            weight: Number(set.weight) || 0,
-            reps: Number(set.reps) || 0,
-            volume: (Number(set.weight) || 0) * (Number(set.reps) || 0),
-            notes: ex.notes || '',
-          });
+          // Same key scheme for both, so a set that changes kind can't end up
+          // duplicated across the two tabs.
+          const key = `${s.id}:${exIdx}:${setIdx}`;
+          if (cardio) {
+            const one = [set];
+            cardioRows.push({
+              key,
+              date: s.date,
+              routine: routineName,
+              exercise: exName,
+              interval: setIdx + 1,
+              minutes: Number(set.minutes) || 0,
+              distanceMi: Number(set.distanceMi) || 0,
+              inclinePct: Number(set.inclinePct) || 0,
+              speedMph: Math.round(cardioSpeedMph(one) * 100) / 100,
+              paceMinPerMi: Math.round(cardioPace(one) * 100) / 100,
+              notes: ex.notes || '',
+            });
+          } else {
+            rows.push({
+              key,
+              date: s.date,
+              routine: routineName,
+              exercise: exName,
+              set: setIdx + 1,
+              weight: Number(set.weight) || 0,
+              reps: Number(set.reps) || 0,
+              volume: (Number(set.weight) || 0) * (Number(set.reps) || 0),
+              notes: ex.notes || '',
+            });
+          }
         });
       });
     });
@@ -1469,33 +1785,45 @@ function buildSyncPayload() {
     sentAt: new Date().toISOString(),
     weights: sortedBodyWeights().map(w => ({ id: w.id, date: w.date, weight: Number(w.weight) || 0 })),
     sets: rows,
+    cardio: cardioRows,
   };
 }
 
+// Sync state shows in two places: full text inside the accordion, and a short
+// version on the closed summary line so you can see it without expanding.
 function renderSyncStatus() {
+  const summaryEl = document.getElementById('accSyncSummary');
+  const set = (cls, full, brief) => {
+    syncStatusEl.className = 'sync-status' + (cls ? ' ' + cls : '');
+    syncStatusEl.textContent = full;
+    if (summaryEl) {
+      summaryEl.className = 'acc-sub' + (cls ? ' ' + cls : '');
+      summaryEl.textContent = brief;
+    }
+  };
+
   if (!syncConfig.url) {
-    syncStatusEl.className = 'sync-status';
-    syncStatusEl.textContent = 'Not configured. Paste your Apps Script URL above to turn sync on.';
-    return;
-  }
-  if (syncInFlight) {
-    syncStatusEl.className = 'sync-status';
-    syncStatusEl.textContent = 'Syncing…';
-    return;
-  }
-  if (syncConfig.lastError) {
-    syncStatusEl.className = 'sync-status err';
-    syncStatusEl.textContent = `Last sync failed: ${syncConfig.lastError}`;
-    return;
-  }
-  if (syncConfig.lastSyncedAt) {
+    set('', 'Not configured. Paste your Apps Script URL above to turn sync on.', 'sync off');
+  } else if (syncInFlight) {
+    set('', 'Syncing…', 'syncing…');
+  } else if (syncConfig.lastError) {
+    set('err', `Last sync failed: ${syncConfig.lastError}`, 'sync failed');
+  } else if (syncConfig.lastSyncedAt) {
     const d = new Date(syncConfig.lastSyncedAt);
-    syncStatusEl.className = 'sync-status ok';
-    syncStatusEl.textContent = `Last synced ${d.toLocaleString()}`;
-    return;
+    set('ok', `Last synced ${d.toLocaleString()}`, `synced ${shortWhen(d)}`);
+  } else {
+    set('', 'Configured — not synced yet.', 'not synced yet');
   }
-  syncStatusEl.className = 'sync-status';
-  syncStatusEl.textContent = 'Configured — not synced yet.';
+}
+
+// "just now" / "14m ago" / "3h ago" / "Aug 29" — short enough for the summary line.
+function shortWhen(date) {
+  const mins = Math.floor((Date.now() - date.getTime()) / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return fmtDateShort(date.toISOString().slice(0, 10));
 }
 
 async function syncNow({ silent = false } = {}) {
@@ -1623,6 +1951,36 @@ const CHART_METRICS = {
     betterIsLower: false,
     compute: sets => sets.reduce((m, s) => Math.max(m, Number(s.reps) || 0), 0),
     format: n => Math.round(n).toLocaleString(),
+  },
+};
+
+/* Cardio has no weight or reps, so it gets its own four metrics. Pace is
+   "lower is better" for the same reason assisted lifts are — a falling line
+   means you covered the same ground faster. */
+const CARDIO_CHART_METRICS = {
+  minutes: {
+    label: 'Duration (min)',
+    betterIsLower: false,
+    compute: cardioMinutes,
+    format: n => (Math.round(n * 10) / 10).toLocaleString(),
+  },
+  distance: {
+    label: 'Distance (mi)',
+    betterIsLower: false,
+    compute: cardioDistance,
+    format: n => (Math.round(n * 100) / 100).toFixed(2),
+  },
+  speed: {
+    label: 'Avg Speed (mph)',
+    betterIsLower: false,
+    compute: cardioSpeedMph,
+    format: n => (Math.round(n * 10) / 10).toFixed(1),
+  },
+  incline: {
+    label: 'Avg Incline (%)',
+    betterIsLower: false,
+    compute: cardioAvgIncline,
+    format: n => (Math.round(n * 10) / 10).toFixed(1),
   },
 };
 
@@ -1807,14 +2165,18 @@ function drawChartsFor(exerciseName) {
     return;
   }
 
-  const metricKeys = Object.keys(CHART_METRICS);
-  const inverted = isInvertedExerciseName(exerciseName);
+  // Cardio exercises get an entirely different metric family — minutes and miles
+  // instead of weight and reps.
+  const cardio = isCardioExerciseName(exerciseName);
+  const METRICS = cardio ? CARDIO_CHART_METRICS : CHART_METRICS;
+  const metricKeys = Object.keys(METRICS);
+  const inverted = !cardio && isInvertedExerciseName(exerciseName);
 
   chartArea.innerHTML = `
     <div class="chart-session-count">${dates.length} session${dates.length !== 1 ? 's' : ''} logged</div>
     ${inverted ? `<div class="editing-banner">Assisted exercise — the number you log is how much the machine helps, so <strong>a falling line is progress</strong>.</div>` : ''}
     ${metricKeys.map(key => {
-      const m = CHART_METRICS[key];
+      const m = METRICS[key];
       const lower = inverted && m.betterIsLower;
       return `
       <div class="chart-card">
@@ -1836,7 +2198,7 @@ function drawChartsFor(exerciseName) {
   }
 
   metricKeys.forEach(key => {
-    const metric = CHART_METRICS[key];
+    const metric = METRICS[key];
     const lower = inverted && metric.betterIsLower;
     const computeFn = metricCompute(metric, inverted);
     const points = dates.map(d => [d, computeFn(byDate.get(d))]);

@@ -340,14 +340,78 @@
   .toast.show{opacity:1; transform:translateX(-50%) translateY(0);}
 
   /* Sets table (Set / Prev / Weight / Reps) */
-  /* Daily weigh-in card on the Pre-Workout screen */
+  /* Daily weigh-in card on the Pre-Workout screen. Date, weight and button share
+     one row to keep the card short — it sits above everything else on the tab. */
   .bw-card .bw-entry-row{
     display:flex;
-    gap:8px;
+    gap:6px;
     margin-top:8px;
+    align-items:stretch;
   }
-  .bw-card .bw-entry-row input{flex:1; min-width:0;}
-  .bw-card .bw-entry-row .btn{flex:0 0 auto; width:auto; padding:0 20px;}
+  .bw-card .bw-entry-row input{min-width:0; font-size:14px; padding:0 8px;}
+  .bw-card #bwDate{flex:1.35;}
+  .bw-card #bwWeight{flex:1; text-align:center;}
+  .bw-card .bw-entry-row .btn{
+    flex:0 0 auto;
+    width:auto;
+    padding:0 16px;
+    font-size:14px;
+  }
+
+  /* Collapsible tools block on the History tab */
+  .tool-accordion{
+    background:var(--bg-elev);
+    border:1px solid var(--border);
+    border-radius:var(--radius);
+    margin-bottom:14px;
+    overflow:hidden;
+  }
+  .tool-accordion > summary{
+    list-style:none;
+    cursor:pointer;
+    padding:14px;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:10px;
+    font-size:13px;
+    font-weight:700;
+    color:var(--text-dim);
+    text-transform:uppercase;
+    letter-spacing:0.04em;
+  }
+  .tool-accordion > summary::-webkit-details-marker{display:none;}
+  .tool-accordion > summary::after{
+    content:'▾';
+    color:var(--accent);
+    font-size:14px;
+    flex-shrink:0;
+    transition:transform .15s ease;
+  }
+  .tool-accordion[open] > summary::after{transform:rotate(180deg);}
+  .tool-accordion > summary .acc-sub{
+    margin-left:auto;
+    font-size:11px;
+    font-weight:600;
+    text-transform:none;
+    letter-spacing:0;
+    color:var(--text-dim);
+    text-align:right;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    white-space:nowrap;
+  }
+  .tool-accordion > summary .acc-sub.ok{color:var(--good);}
+  .tool-accordion > summary .acc-sub.err{color:var(--danger);}
+  .acc-body{padding:0 14px 14px;}
+  .acc-section-label{
+    font-size:11px;
+    font-weight:700;
+    color:var(--text-dim);
+    text-transform:uppercase;
+    letter-spacing:0.04em;
+    margin-bottom:8px;
+  }
   .bw-stats{
     margin-top:10px;
     font-size:12px;
@@ -417,6 +481,63 @@
     font-size:12px;
     margin-bottom:10px;
   }
+  /* Cardio rows: minutes / distance / incline instead of weight x reps */
+  .sets-header.cardio-header .col-min{flex:1;}
+  .sets-header.cardio-header .col-dist{flex:1;}
+  .sets-header.cardio-header .col-incline{flex:1;}
+  .set-row.cardio-row input{flex:1; min-width:0; text-align:center;}
+  .cardio-prev{
+    display:block;
+    margin:-2px 0 10px;
+    padding:8px 10px;
+    background:var(--bg-elev);
+    border-left:3px solid var(--good);
+    border-radius:0 8px 8px 0;
+    font-size:12px;
+    line-height:1.45;
+    color:var(--text-dim);
+  }
+  .cardio-prev[hidden]{display:none;}
+  .cardio-prev .cardio-prev-date{
+    font-size:10px;
+    font-weight:700;
+    letter-spacing:0.03em;
+    color:var(--good);
+    margin-right:6px;
+  }
+  .cardio-derived{
+    text-align:center;
+    font-size:12px;
+    font-weight:700;
+    color:var(--accent);
+    padding:2px 0 8px;
+    min-height:16px;
+  }
+  .cardio-tag{
+    display:inline-block;
+    background:rgba(74,222,128,0.15);
+    color:var(--good);
+    border-radius:5px;
+    padding:1px 6px;
+    font-size:10px;
+    font-weight:700;
+    margin-left:6px;
+    vertical-align:middle;
+  }
+  .ex-opt{
+    display:flex;
+    align-items:center;
+    gap:10px;
+    font-size:12px;
+    color:var(--text-dim);
+    margin:0 0 8px;
+  }
+  .ex-opt:last-child{margin-bottom:0;}
+  .ex-opt[hidden]{display:none;}
+  .ex-opt input[type="checkbox"]{
+    width:auto; min-height:0; margin:0; flex:0 0 auto;
+  }
+
   .inverted-tag{
     display:inline-block;
     background:var(--accent-dim);
@@ -606,9 +727,9 @@
              app opens, so it works on rest days too — not just gym days. -->
         <div class="card bw-card">
           <label for="bwWeight">Daily weigh-in</label>
-          <input type="date" id="bwDate" autocomplete="off">
           <div class="bw-entry-row">
-            <input type="number" id="bwWeight" inputmode="decimal" step="0.1" min="0" placeholder="Weight (lb)">
+            <input type="date" id="bwDate" autocomplete="off">
+            <input type="number" id="bwWeight" inputmode="decimal" step="0.1" min="0" placeholder="lb">
             <button class="btn btn-primary" id="bwSaveBtn">Log</button>
           </div>
           <div class="bw-stats" id="bwStats"></div>
@@ -679,30 +800,39 @@
 
     <!-- HISTORY VIEW -->
     <section id="view-history" class="view">
-      <div class="card">
-        <label>Backup &amp; Export</label>
-        <div class="row" style="margin-top:8px;">
-          <button class="btn btn-secondary btn-sm" id="exportJsonBtn">Download Backup (JSON)</button>
-          <button class="btn btn-secondary btn-sm" id="exportCsvBtn">Download CSV</button>
-        </div>
-        <button class="btn btn-secondary btn-sm btn-block" id="exportWeightCsvBtn" style="margin-top:8px;">Download Weight CSV</button>
-        <button class="btn btn-secondary btn-sm btn-block" id="importJsonBtn" style="margin-top:8px;">Restore from Backup</button>
-        <input type="file" id="importFileInput" accept="application/json,.json" style="display:none;">
-      </div>
+      <!-- Data tools live in a collapsed accordion: needed occasionally, but they
+           were pushing the actual workout history below the fold every time. -->
+      <details class="tool-accordion" id="dataToolsAccordion">
+        <summary>
+          <span>Data &amp; Sync</span>
+          <span class="acc-sub" id="accSyncSummary"></span>
+        </summary>
+        <div class="acc-body">
+          <div class="acc-section-label">Backup &amp; Export</div>
+          <div class="row">
+            <button class="btn btn-secondary btn-sm" id="exportJsonBtn">Backup (JSON)</button>
+            <button class="btn btn-secondary btn-sm" id="exportCsvBtn">Workout CSV</button>
+          </div>
+          <div class="row" style="margin-top:8px;">
+            <button class="btn btn-secondary btn-sm" id="exportCardioCsvBtn">Cardio CSV</button>
+            <button class="btn btn-secondary btn-sm" id="exportWeightCsvBtn">Weight CSV</button>
+          </div>
+          <button class="btn btn-secondary btn-sm btn-block" id="importJsonBtn" style="margin-top:8px;">Restore from Backup</button>
+          <input type="file" id="importFileInput" accept="application/json,.json" style="display:none;">
 
-      <!-- Cloud sync. The URL is a write capability for the spreadsheet, so it's
-           entered here on the device and never lives in the repo. -->
-      <div class="card">
-        <label>Cloud Sync (Google Sheet)</label>
-        <div class="sync-hint">Pushes weigh-ins and workouts to your Health Hub sheet. Runs when the app opens and after you save — iOS won't let it run in the background.</div>
-        <input type="url" id="syncUrlInput" placeholder="Apps Script web app URL" autocomplete="off" spellcheck="false">
-        <input type="text" id="syncTokenInput" placeholder="Shared secret" autocomplete="off" spellcheck="false" style="margin-top:8px;">
-        <div class="row" style="margin-top:10px;">
-          <button class="btn btn-secondary btn-sm" id="syncSaveBtn">Save Settings</button>
-          <button class="btn btn-primary btn-sm" id="syncNowBtn">Sync Now</button>
+          <!-- The Apps Script URL is a write capability for the spreadsheet, so it's
+               entered here on the device and never lives in the repo. -->
+          <div class="acc-section-label" style="margin-top:18px;">Cloud Sync (Google Sheet)</div>
+          <div class="sync-hint">Pushes weigh-ins and workouts to your Health Hub sheet when the app opens and after you save. iOS won't let it run in the background.</div>
+          <input type="url" id="syncUrlInput" placeholder="Apps Script web app URL" autocomplete="off" spellcheck="false">
+          <input type="text" id="syncTokenInput" placeholder="Shared secret" autocomplete="off" spellcheck="false" style="margin-top:8px;">
+          <div class="row" style="margin-top:10px;">
+            <button class="btn btn-secondary btn-sm" id="syncSaveBtn">Save Settings</button>
+            <button class="btn btn-primary btn-sm" id="syncNowBtn">Sync Now</button>
+          </div>
+          <div class="sync-status" id="syncStatus"></div>
         </div>
-        <div class="sync-status" id="syncStatus"></div>
-      </div>
+      </details>
 
       <div id="historyList"></div>
     </section>
