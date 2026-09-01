@@ -151,8 +151,25 @@ function exerciseIsCardio(ex) {
   return isCardioExerciseName(ex && ex.name);
 }
 
+/* Duration is stored as whole seconds. Bouts logged before that change stored
+   decimal `minutes` instead, so read either shape and never migrate the data —
+   there is nothing to go wrong at load time that way. */
+function boutSeconds(bout) {
+  if (!bout) return 0;
+  if (bout.seconds !== undefined && bout.seconds !== null && bout.seconds !== '') {
+    return Number(bout.seconds) || 0;
+  }
+  return Math.round((Number(bout.minutes) || 0) * 60);
+}
+
+function cardioSeconds(sets) {
+  return (sets || []).reduce((sum, s) => sum + boutSeconds(s), 0);
+}
+
+// Everything downstream (charts, pace, the spreadsheet) still thinks in decimal
+// minutes; only the input and the display are mm:ss.
 function cardioMinutes(sets) {
-  return (sets || []).reduce((sum, s) => sum + (Number(s.minutes) || 0), 0);
+  return cardioSeconds(sets) / 60;
 }
 
 function cardioDistance(sets) {
@@ -165,12 +182,12 @@ function cardioSpeedMph(sets) {
   return cardioDistance(sets) / (min / 60);
 }
 
-// Weighted by distance so a long slow bout doesn't get averaged against a sprint.
+// Weighted by time so a long easy stretch doesn't get averaged against a short hill.
 function cardioAvgIncline(sets) {
-  const list = (sets || []).filter(s => Number(s.minutes) > 0);
+  const list = (sets || []).filter(s => boutSeconds(s) > 0);
   if (!list.length) return 0;
-  const totalMin = list.reduce((sum, s) => sum + Number(s.minutes), 0);
-  return list.reduce((sum, s) => sum + (Number(s.inclinePct) || 0) * Number(s.minutes), 0) / totalMin;
+  const total = list.reduce((sum, s) => sum + boutSeconds(s), 0);
+  return list.reduce((sum, s) => sum + (Number(s.inclinePct) || 0) * boutSeconds(s), 0) / total;
 }
 
 function fmtPace(minutesPerMile) {
@@ -187,11 +204,11 @@ function cardioPace(sets) {
 
 // One-line summary used on the PREV banner, history cards and the workout screen.
 function cardioSummary(sets) {
-  const min = cardioMinutes(sets);
-  if (!min) return '';
+  const secs = cardioSeconds(sets);
+  if (!secs) return '';
   const dist = cardioDistance(sets);
   const incline = cardioAvgIncline(sets);
-  const bits = [`${Math.round(min * 10) / 10} min`];
+  const bits = [formatDuration(secs)];
   if (dist > 0) bits.push(`${(Math.round(dist * 100) / 100).toFixed(2)} mi`);
   if (incline > 0) bits.push(`${Math.round(incline * 10) / 10}% incline`);
   if (dist > 0) bits.push(`${fmtPace(cardioPace(sets))}/mi`);
@@ -641,8 +658,30 @@ function escapeHtml(str) {
 
 let draftExercises = []; // [{ id, name, sets: [{weight, reps}], notes }]
 
+// While editing, minutes and seconds are two separate fields (mm / ss); they're
+// folded into a single whole-second count on save.
 function newCardioBout() {
-  return { minutes: '', distanceMi: '', inclinePct: '' };
+  return { mm: '', ss: '', distanceMi: '', inclinePct: '' };
+}
+
+// Split a stored bout back into the two edit fields.
+function boutToFields(bout) {
+  const total = boutSeconds(bout);
+  if (!total) {
+    return {
+      mm: bout && bout.mm !== undefined ? bout.mm : '',
+      ss: bout && bout.ss !== undefined ? bout.ss : '',
+    };
+  }
+  return { mm: String(Math.floor(total / 60)), ss: String(total % 60).padStart(2, '0') };
+}
+
+// mm/ss as typed -> total seconds. Seconds over 59 roll up rather than being
+// rejected, so typing "90" in the seconds box gives you 1:30 instead of an error.
+function fieldsToSeconds(bout) {
+  const mm = Number(bout.mm) || 0;
+  const ss = Number(bout.ss) || 0;
+  return Math.max(0, Math.round(mm * 60 + ss));
 }
 
 function newDraftExercise(name = '') {
@@ -720,8 +759,9 @@ function buildCardioRows(block, ex, perf) {
   header.innerHTML = `
     <span class="set-idx">#</span>
     <span class="col-min">MIN</span>
+    <span class="col-sec">SEC</span>
     <span class="col-dist">DIST (MI)</span>
-    <span class="col-incline">INCLINE %</span>
+    <span class="col-incline">INCL %</span>
     <span class="col-remove"></span>
   `;
   block.appendChild(header);
@@ -732,28 +772,36 @@ function buildCardioRows(block, ex, perf) {
   const repaintDerived = () => {
     const el = block.querySelector('[data-role="cardio-derived"]');
     if (!el) return;
-    const min = cardioMinutes(ex.sets);
+    const secs = ex.sets.reduce((sum, b) => sum + fieldsToSeconds(b), 0);
     const dist = cardioDistance(ex.sets);
-    if (!min) { el.textContent = ''; return; }
-    const parts = [`${Math.round(min * 10) / 10} min total`];
+    if (!secs) { el.textContent = ''; return; }
+    const parts = [formatDuration(secs)];
     if (dist > 0) {
-      parts.push(`${(Math.round(cardioSpeedMph(ex.sets) * 10) / 10).toFixed(1)} mph`);
-      parts.push(`${fmtPace(cardioPace(ex.sets))}/mi`);
+      const mph = dist / (secs / 3600);
+      parts.push(`${(Math.round(mph * 10) / 10).toFixed(1)} mph`);
+      parts.push(`${fmtPace((secs / 60) / dist)}/mi`);
     }
     el.textContent = parts.join('  ·  ');
   };
 
   ex.sets.forEach((bout, si) => {
+    // Seed the two edit fields from whatever shape the bout is currently in.
+    const f = boutToFields(bout);
+    if (bout.mm === undefined) bout.mm = f.mm;
+    if (bout.ss === undefined) bout.ss = f.ss;
+
     const row = document.createElement('div');
     row.className = 'set-row cardio-row';
     row.innerHTML = `
       <span class="set-idx">${si + 1}</span>
-      <input type="number" inputmode="decimal" placeholder="min" min="0" step="any" value="${bout.minutes ?? ''}" data-role="c-min">
+      <input type="number" inputmode="numeric" placeholder="12" min="0" step="1" value="${bout.mm ?? ''}" data-role="c-min">
+      <input type="number" inputmode="numeric" placeholder="00" min="0" step="1" value="${bout.ss ?? ''}" data-role="c-sec">
       <input type="number" inputmode="decimal" placeholder="mi" min="0" step="any" value="${bout.distanceMi ?? ''}" data-role="c-dist">
       <input type="number" inputmode="decimal" placeholder="%" min="0" step="any" value="${bout.inclinePct ?? ''}" data-role="c-incline">
       <button class="remove-set" data-role="remove-set" title="Remove">–</button>
     `;
-    row.querySelector('[data-role="c-min"]').addEventListener('input', (e) => { bout.minutes = e.target.value; repaintDerived(); });
+    row.querySelector('[data-role="c-min"]').addEventListener('input', (e) => { bout.mm = e.target.value; repaintDerived(); });
+    row.querySelector('[data-role="c-sec"]').addEventListener('input', (e) => { bout.ss = e.target.value; repaintDerived(); });
     row.querySelector('[data-role="c-dist"]').addEventListener('input', (e) => { bout.distanceMi = e.target.value; repaintDerived(); });
     row.querySelector('[data-role="c-incline"]').addEventListener('input', (e) => { bout.inclinePct = e.target.value; });
     row.querySelector('[data-role="remove-set"]').addEventListener('click', () => {
@@ -1009,12 +1057,12 @@ endWorkoutBtn.addEventListener('click', () => {
       const kind = exerciseIsCardio({ name: ex.name, kind: ex.kind }) ? 'cardio' : 'strength';
       const sets = kind === 'cardio'
         ? ex.sets
-            .filter(s => s.minutes !== '' && s.minutes != null && !isNaN(Number(s.minutes)) && Number(s.minutes) > 0)
             .map(s => ({
-              minutes: Number(s.minutes),
+              seconds: fieldsToSeconds(s),
               distanceMi: s.distanceMi === '' || s.distanceMi == null ? 0 : Number(s.distanceMi) || 0,
               inclinePct: s.inclinePct === '' || s.inclinePct == null ? 0 : Number(s.inclinePct) || 0,
             }))
+            .filter(s => s.seconds > 0)
         : ex.sets
             .filter(s => s.weight !== '' && s.reps !== '' && !isNaN(Number(s.weight)) && !isNaN(Number(s.reps)))
             .map(s => ({ weight: Number(s.weight), reps: Number(s.reps) }));
@@ -1125,8 +1173,15 @@ function renderRoutineExerciseInputs() {
   draftRoutine.exercises.forEach((ex, i) => {
     const row = document.createElement('div');
     row.className = 'set-row';
+    // Up/down buttons rather than drag-and-drop: dragging a list item on a phone
+    // fights with page scrolling, and this only ever needs to move a few rows.
+    const last = draftRoutine.exercises.length - 1;
     row.innerHTML = `
       <span class="set-idx">${i + 1}</span>
+      <div class="reorder-btns">
+        <button class="reorder-btn" data-role="move-up" title="Move up" ${i === 0 ? 'disabled' : ''}>▲</button>
+        <button class="reorder-btn" data-role="move-down" title="Move down" ${i === last ? 'disabled' : ''}>▼</button>
+      </div>
       <input type="text" placeholder="Exercise name" list="exerciseNames" value="${escapeHtml(ex.name)}" data-role="rex-name">
       <input type="number" class="rex-sets" min="1" step="1" placeholder="Sets" value="${ex.sets}" data-role="rex-sets">
       <button class="remove-set" data-role="remove-rex" title="Remove">–</button>
@@ -1137,6 +1192,8 @@ function renderRoutineExerciseInputs() {
     row.querySelector('[data-role="rex-sets"]').addEventListener('input', (e) => {
       draftRoutine.exercises[i].sets = e.target.value;
     });
+    row.querySelector('[data-role="move-up"]').addEventListener('click', () => moveRoutineExercise(i, -1));
+    row.querySelector('[data-role="move-down"]').addEventListener('click', () => moveRoutineExercise(i, 1));
     row.querySelector('[data-role="remove-rex"]').addEventListener('click', () => {
       draftRoutine.exercises.splice(i, 1);
       if (draftRoutine.exercises.length === 0) draftRoutine.exercises.push({ name: '', sets: '', exerciseId: null });
@@ -1144,6 +1201,20 @@ function renderRoutineExerciseInputs() {
     });
     routineExerciseListEl.appendChild(row);
   });
+}
+
+/* Swap a routine exercise with its neighbour. Nothing is saved until you hit
+   Save Routine, so this is as cancellable as any other edit in the editor. */
+function moveRoutineExercise(index, delta) {
+  const list = draftRoutine.exercises;
+  const target = index + delta;
+  if (target < 0 || target >= list.length) return;
+  [list[index], list[target]] = [list[target], list[index]];
+  renderRoutineExerciseInputs();
+  // Keep the moved row's button under the finger so repeated taps keep moving it.
+  const rows = routineExerciseListEl.querySelectorAll('.set-row');
+  const btn = rows[target] && rows[target].querySelector(delta < 0 ? '[data-role="move-up"]' : '[data-role="move-down"]');
+  if (btn && !btn.disabled && typeof btn.focus === 'function') btn.focus();
 }
 
 document.getElementById('newRoutineBtn').addEventListener('click', () => openRoutineEditor(null));
@@ -1336,7 +1407,7 @@ function renderHistory() {
         ${session.exercises.map(ex => {
           const cardio = exerciseIsCardio(ex);
           const right = cardio
-            ? `${Math.round(cardioMinutes(ex.sets) * 10) / 10} min`
+            ? formatDuration(cardioSeconds(ex.sets))
             : `${fmtNum(exerciseVolume(ex))} vol`;
           const detail = cardio
             ? escapeHtml(cardioSummary(ex.sets))
@@ -1437,9 +1508,10 @@ function renderSessionEditorCard(session) {
         row.innerHTML = cardio
           ? `
           <span class="set-idx">${setIdx + 1}</span>
-          <input type="number" inputmode="decimal" step="any" min="0" value="${set.minutes ?? ''}" data-role="e-min" placeholder="Min">
+          <input type="number" inputmode="numeric" step="1" min="0" value="${boutToFields(set).mm}" data-role="e-min" placeholder="Min">
+          <input type="number" inputmode="numeric" step="1" min="0" value="${boutToFields(set).ss}" data-role="e-sec" placeholder="Sec">
           <input type="number" inputmode="decimal" step="any" min="0" value="${set.distanceMi ?? ''}" data-role="e-dist" placeholder="Miles">
-          <input type="number" inputmode="decimal" step="any" min="0" value="${set.inclinePct ?? ''}" data-role="e-incline" placeholder="Incline %">
+          <input type="number" inputmode="decimal" step="any" min="0" value="${set.inclinePct ?? ''}" data-role="e-incline" placeholder="Incl %">
           <button class="remove-set" data-role="e-rm" title="Remove">–</button>
         `
           : `
@@ -1449,7 +1521,11 @@ function renderSessionEditorCard(session) {
           <button class="remove-set" data-role="e-rm" title="Remove set">–</button>
         `;
         if (cardio) {
-          row.querySelector('[data-role="e-min"]').addEventListener('input', (e) => { set.minutes = e.target.value; });
+          // Seed the edit fields so an untouched row keeps its existing duration.
+          const seeded = boutToFields(set);
+          set.mm = seeded.mm; set.ss = seeded.ss;
+          row.querySelector('[data-role="e-min"]').addEventListener('input', (e) => { set.mm = e.target.value; });
+          row.querySelector('[data-role="e-sec"]').addEventListener('input', (e) => { set.ss = e.target.value; });
           row.querySelector('[data-role="e-dist"]').addEventListener('input', (e) => { set.distanceMi = e.target.value; });
           row.querySelector('[data-role="e-incline"]').addEventListener('input', (e) => { set.inclinePct = e.target.value; });
         } else {
@@ -1491,12 +1567,12 @@ function renderSessionEditorCard(session) {
           notes: (ex.notes || '').trim(),
           sets: exerciseIsCardio(ex)
             ? ex.sets
-                .filter(s => s.minutes !== '' && s.minutes != null && !isNaN(Number(s.minutes)) && Number(s.minutes) > 0)
                 .map(s => ({
-                  minutes: Number(s.minutes),
+                  seconds: fieldsToSeconds(s),
                   distanceMi: s.distanceMi === '' || s.distanceMi == null ? 0 : Number(s.distanceMi) || 0,
                   inclinePct: s.inclinePct === '' || s.inclinePct == null ? 0 : Number(s.inclinePct) || 0,
                 }))
+                .filter(s => s.seconds > 0)
             : ex.sets
                 .filter(s => s.weight !== '' && s.reps !== '' && !isNaN(Number(s.weight)) && !isNaN(Number(s.reps)))
                 .map(s => ({ weight: Number(s.weight), reps: Number(s.reps) })),
@@ -1572,7 +1648,7 @@ function buildCsv() {
 }
 
 function buildCardioCsv() {
-  const rows = [['Date', 'Routine', 'Exercise', 'Interval', 'Minutes', 'Distance (mi)', 'Incline %', 'Avg Speed (mph)', 'Pace (min/mi)', 'Notes']];
+  const rows = [['Date', 'Routine', 'Exercise', 'Interval', 'Duration', 'Minutes', 'Distance (mi)', 'Incline %', 'Avg Speed (mph)', 'Pace (min/mi)', 'Notes']];
   const sorted = [...sessions].sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id));
   sorted.forEach(s => {
     const routineName = displayRoutineName(s) || '';
@@ -1586,7 +1662,8 @@ function buildCardioCsv() {
           routineName,
           exName,
           i + 1,
-          bout.minutes,
+          formatDuration(boutSeconds(bout)),
+          Math.round(boutSeconds(bout) / 60 * 100) / 100,
           bout.distanceMi,
           bout.inclinePct,
           Math.round(cardioSpeedMph(one) * 100) / 100,
@@ -1755,7 +1832,8 @@ function buildSyncPayload() {
               routine: routineName,
               exercise: exName,
               interval: setIdx + 1,
-              minutes: Number(set.minutes) || 0,
+              seconds: boutSeconds(set),
+              minutes: Math.round(boutSeconds(set) / 60 * 100) / 100,
               distanceMi: Number(set.distanceMi) || 0,
               inclinePct: Number(set.inclinePct) || 0,
               speedMph: Math.round(cardioSpeedMph(one) * 100) / 100,
