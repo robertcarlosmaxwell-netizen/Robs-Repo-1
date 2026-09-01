@@ -1,7 +1,7 @@
 // Bump this version string any time index.html/app.js/manifest.json/icons change.
 // The browser re-installs the service worker whenever this file's bytes change, which
 // is what actually pushes updated app files out to people who already installed the app.
-const CACHE_NAME = 'workout-tracker-v13';
+const CACHE_NAME = 'workout-tracker-v14';
 const ASSETS = [
   './',
   './index.html',
@@ -18,7 +18,15 @@ const CDN_ASSETS = [
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(CACHE_NAME).then(async (cache) => {
-      await cache.addAll(ASSETS).catch(() => {});
+      // cache:'reload' forces these past the browser's ordinary HTTP cache. Without
+      // it a freshly-deployed app.js can be served from the HTTP cache during install,
+      // so the version string gets bumped while the old file quietly gets re-cached.
+      await Promise.all(ASSETS.map(async (url) => {
+        try {
+          const res = await fetch(new Request(url, { cache: 'reload' }));
+          if (res && res.ok) await cache.put(url, res);
+        } catch (e) { /* offline install: whatever is already cached stays */ }
+      }));
       // Cache the charting library separately so one failure doesn't block the app shell.
       await Promise.all(CDN_ASSETS.map((url) => cache.add(url).catch(() => {})));
     })

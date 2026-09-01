@@ -1098,6 +1098,8 @@ endWorkoutBtn.addEventListener('click', () => {
   clearActiveWorkoutStorage();
   draftExercises = [newDraftExercise()];
   renderExerciseList();
+  // Safe moment to pick up an update that arrived mid-workout.
+  applyUpdateIfDeferred();
   sessionDateInput.value = todayStr();
   routineSelect.value = '';
   showPreWorkoutScreen();
@@ -2351,9 +2353,71 @@ window.addEventListener('pageshow', () => {
 // shouldn't greet you with an error toast every time you open the app.
 scheduleSync();
 
-/* ---------- Service worker registration ---------- */
+/* ---------- Service worker registration & updates ----------
+   The service worker already calls skipWaiting()/clients.claim(), so a new version
+   takes control on the first launch after a deploy. But taking control doesn't
+   reload anything — the HTML and JS already in memory are still the old ones, which
+   is why an update used to need a second launch to appear.
+
+   So: reload as soon as the new worker takes over. Except mid-workout, where a
+   reload would shut the keyboard and drop a half-typed number; there we just offer
+   a button and refresh when the workout ends. */
+let swUpdatePending = false;
+let swReloading = false;
+
+// Indirected so the update flow can be tested without a real navigation.
+function reloadApp() {
+  window.location.reload();
+}
+
+function applyPendingUpdate() {
+  if (swReloading) return;
+  swReloading = true;
+  showToast('Updating…');
+  // A beat so the toast paints before the page goes away.
+  setTimeout(() => reloadApp(), 250);
+}
+
+function showUpdateBanner() {
+  if (document.getElementById('updateBanner')) return;
+  const bar = document.createElement('button');
+  bar.id = 'updateBanner';
+  bar.className = 'update-banner';
+  bar.textContent = 'Update ready — tap to refresh';
+  bar.addEventListener('click', applyPendingUpdate);
+  document.body.appendChild(bar);
+}
+
+// Called when a workout finishes, so a deferred update lands at a safe moment.
+function applyUpdateIfDeferred() {
+  if (swUpdatePending) applyPendingUpdate();
+}
+
 if ('serviceWorker' in navigator) {
+  // Whether this page was already under a worker's control at load. On a genuine
+  // first install there's no controller and controllerchange fires immediately —
+  // reloading then would be pointless.
+  const hadController = !!navigator.serviceWorker.controller;
+
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!hadController) return;
+    if (activeWorkout) {
+      swUpdatePending = true;
+      showUpdateBanner();
+      return;
+    }
+    applyPendingUpdate();
+  });
+
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('service-worker.js').catch(() => {});
+    navigator.serviceWorker.register('service-worker.js')
+      .then((reg) => {
+        // iOS resumes a frozen page rather than reloading it, so an app left open
+        // for days would otherwise never check. Ask on every foreground.
+        document.addEventListener('visibilitychange', () => {
+          if (document.visibilityState === 'visible') reg.update().catch(() => {});
+        });
+      })
+      .catch(() => {});
   });
 }
