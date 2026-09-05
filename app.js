@@ -1045,30 +1045,174 @@ document.getElementById('startWorkoutBtn').addEventListener('click', () => {
   startTimerInterval();
 });
 
+/* ---------- SAVE GUARD ----------
+   Everything the save path used to throw away in silence. A set with a weight and
+   no reps, or an exercise sitting in the routine that never got a number typed
+   into it, simply vanished on End Workout — which is how three weeks of squats
+   went missing without a single warning. Discarding is still allowed; it just has
+   to be a decision now. */
+
+// Cardio bouts only need a duration to be worth keeping — distance and incline
+// are optional, since not every machine reports them.
+function normalizeExercise(ex) {
+  const kind = exerciseIsCardio({ name: ex.name, kind: ex.kind }) ? 'cardio' : 'strength';
+  const sets = kind === 'cardio'
+    ? (ex.sets || [])
+        .map(s => ({
+          seconds: fieldsToSeconds(s),
+          distanceMi: s.distanceMi === '' || s.distanceMi == null ? 0 : Number(s.distanceMi) || 0,
+          inclinePct: s.inclinePct === '' || s.inclinePct == null ? 0 : Number(s.inclinePct) || 0,
+        }))
+        .filter(s => s.seconds > 0)
+    : (ex.sets || [])
+        .filter(s => s.weight !== '' && s.reps !== '' && !isNaN(Number(s.weight)) && !isNaN(Number(s.reps)))
+        .map(s => ({ weight: Number(s.weight), reps: Number(s.reps) }));
+  return { name: (ex.name || '').trim(), kind, notes: (ex.notes || '').trim(), sets };
+}
+
+const blank = (v) => String(v == null ? '' : v).trim() === '';
+
+function describeStrengthRow(s) {
+  const w = blank(s.weight) ? 'weight blank' : `${String(s.weight).trim()} lb`;
+  const r = blank(s.reps) ? 'reps blank' : `${String(s.reps).trim()} reps`;
+  return `${w}, ${r}`;
+}
+
+function describeCardioRow(s) {
+  const bits = [];
+  const f = boutToFields(s);
+  bits.push(blank(f.mm) && blank(f.ss) ? 'no time' : `${blank(f.mm) ? 0 : f.mm}:${String(blank(f.ss) ? 0 : f.ss).padStart(2, '0')}`);
+  if (!blank(s.distanceMi)) bits.push(`${String(s.distanceMi).trim()} mi`);
+  if (!blank(s.inclinePct)) bits.push(`${String(s.inclinePct).trim()}% incline`);
+  return bits.join(', ');
+}
+
+/* Splits a draft into what will actually be written and what would be lost.
+   A wholly blank set row is not a loss — the app always keeps a trailing empty
+   row — so only rows with something typed in them get flagged. */
+function auditDraftExercises(drafts) {
+  const exercises = [];
+  const issues = [];
+  // Index in `drafts` of each kept exercise, so a caller that needs to merge
+  // fields back onto the original (the history editor keeps exerciseId) can
+  // line them up even when entries in between were dropped.
+  const keptIndexes = [];
+
+  (drafts || []).forEach((ex, exIdx) => {
+    const clean = normalizeExercise(ex);
+    const cardio = clean.kind === 'cardio';
+    const rows = [];
+
+    (ex.sets || []).forEach((s, i) => {
+      if (cardio) {
+        if (fieldsToSeconds(s) > 0) return;
+        const f = boutToFields(s);
+        if (!blank(f.mm) || !blank(f.ss) || !blank(s.distanceMi) || !blank(s.inclinePct)) {
+          rows.push({ index: i + 1, detail: describeCardioRow(s) });
+        }
+      } else {
+        const usable = !blank(s.weight) && !blank(s.reps) && !isNaN(Number(s.weight)) && !isNaN(Number(s.reps));
+        if (usable) return;
+        if (!blank(s.weight) || !blank(s.reps)) rows.push({ index: i + 1, detail: describeStrengthRow(s) });
+      }
+    });
+
+    if (!clean.name) {
+      // An unnamed row with data typed into it can't be saved at all.
+      if (clean.sets.length || rows.length) {
+        issues.push({ name: 'Unnamed exercise', type: 'unnamed', rows, keptSets: clean.sets.length });
+      }
+      return;
+    }
+
+    if (clean.sets.length === 0) {
+      issues.push({ name: displayExerciseName(clean), type: rows.length ? 'partial-only' : 'empty', rows });
+      return;
+    }
+
+    if (rows.length) issues.push({ name: displayExerciseName(clean), type: 'partial', rows });
+    exercises.push(clean);
+    keptIndexes.push(exIdx);
+  });
+
+  return { exercises, issues, keptIndexes };
+}
+
+function guardIssueHtml(issue) {
+  let why;
+  if (issue.type === 'empty') why = 'nothing logged — will not be saved';
+  else if (issue.type === 'unnamed') why = 'no exercise name — cannot be saved';
+  else if (issue.type === 'partial-only') why = `no complete sets — will not be saved`;
+  else why = `${issue.rows.length} incomplete set${issue.rows.length !== 1 ? 's' : ''} will be dropped`;
+  const rows = issue.rows.length
+    ? `<div class="guard-rows">${issue.rows.map(r => `<div>Set ${r.index}: ${escapeHtml(r.detail)}</div>`).join('')}</div>`
+    : '';
+  return `
+    <div class="guard-item${issue.type === 'empty' ? ' soft' : ''}" data-issue="${issue.type}">
+      <div class="guard-name">${escapeHtml(issue.name)}</div>
+      <div class="guard-why">${escapeHtml(why)}</div>
+      ${rows}
+    </div>`;
+}
+
+function closeSaveGuard() {
+  const el = document.getElementById('saveGuard');
+  if (el) el.remove();
+}
+
+/* Fix is the primary action. Discarding is possible but deliberate. */
+function showSaveGuard(issues, { onFix, onDiscard, discardLabel } = {}) {
+  closeSaveGuard();
+  const wrap = document.createElement('div');
+  wrap.id = 'saveGuard';
+  wrap.className = 'guard-backdrop';
+  wrap.innerHTML = `
+    <div class="guard-sheet" role="dialog" aria-modal="true" aria-labelledby="guardTitle">
+      <div class="guard-title" id="guardTitle">Some of this won't be saved</div>
+      <div class="guard-list">${issues.map(guardIssueHtml).join('')}</div>
+      <div class="guard-actions">
+        <button class="btn btn-primary" data-role="guard-fix">Go Back &amp; Fix</button>
+        <button class="btn btn-secondary btn-sm" data-role="guard-discard">${escapeHtml(discardLabel || 'Save Without Them')}</button>
+      </div>
+    </div>`;
+  wrap.querySelector('[data-role="guard-fix"]').addEventListener('click', () => {
+    closeSaveGuard();
+    if (onFix) onFix();
+  });
+  wrap.querySelector('[data-role="guard-discard"]').addEventListener('click', () => {
+    closeSaveGuard();
+    if (onDiscard) onDiscard();
+  });
+  // Tapping the backdrop is the same as backing out — the safe direction.
+  wrap.addEventListener('click', (e) => {
+    if (e.target !== wrap) return;
+    closeSaveGuard();
+    if (onFix) onFix();
+  });
+  document.body.appendChild(wrap);
+  return wrap;
+}
+
 endWorkoutBtn.addEventListener('click', () => {
+  if (!activeWorkout) return;
+
+  const { exercises: cleanExercises, issues } = auditDraftExercises(draftExercises);
+  if (issues.length > 0) {
+    // Don't stop the clock yet — going back to fix things has to leave the
+    // workout exactly as it was.
+    showSaveGuard(issues, {
+      onFix: () => { renderExerciseList(); },
+      onDiscard: () => finishWorkout(cleanExercises),
+    });
+    return;
+  }
+  finishWorkout(cleanExercises);
+});
+
+function finishWorkout(cleanExercises) {
   if (!activeWorkout) return;
   const durationSeconds = Math.max(0, Math.floor((Date.now() - activeWorkout.startTime) / 1000));
   stopTimerInterval();
-
-  // Cardio bouts only need a duration to be worth keeping — distance and incline
-  // are optional, since not every machine reports them.
-  const cleanExercises = draftExercises
-    .map(ex => {
-      const kind = exerciseIsCardio({ name: ex.name, kind: ex.kind }) ? 'cardio' : 'strength';
-      const sets = kind === 'cardio'
-        ? ex.sets
-            .map(s => ({
-              seconds: fieldsToSeconds(s),
-              distanceMi: s.distanceMi === '' || s.distanceMi == null ? 0 : Number(s.distanceMi) || 0,
-              inclinePct: s.inclinePct === '' || s.inclinePct == null ? 0 : Number(s.inclinePct) || 0,
-            }))
-            .filter(s => s.seconds > 0)
-        : ex.sets
-            .filter(s => s.weight !== '' && s.reps !== '' && !isNaN(Number(s.weight)) && !isNaN(Number(s.reps)))
-            .map(s => ({ weight: Number(s.weight), reps: Number(s.reps) }));
-      return { name: (ex.name || '').trim(), kind, notes: (ex.notes || '').trim(), sets };
-    })
-    .filter(ex => ex.name && ex.sets.length > 0);
 
   if (cleanExercises.length > 0) {
     const linked = promptAddNewExercises(cleanExercises.map(ex => ex.name));
@@ -1103,7 +1247,7 @@ endWorkoutBtn.addEventListener('click', () => {
   sessionDateInput.value = todayStr();
   routineSelect.value = '';
   showPreWorkoutScreen();
-});
+}
 
 /* ---------- ROUTINES VIEW ---------- */
 const routineListEl = document.getElementById('routineList');
@@ -1562,30 +1706,11 @@ function renderSessionEditorCard(session) {
       editingSessionId = null;
       renderHistory();
     });
-    actions.querySelector('[data-role="save"]').addEventListener('click', () => {
-      const cleaned = draft.exercises
-        .map(ex => ({
-          ...ex,
-          notes: (ex.notes || '').trim(),
-          sets: exerciseIsCardio(ex)
-            ? ex.sets
-                .map(s => ({
-                  seconds: fieldsToSeconds(s),
-                  distanceMi: s.distanceMi === '' || s.distanceMi == null ? 0 : Number(s.distanceMi) || 0,
-                  inclinePct: s.inclinePct === '' || s.inclinePct == null ? 0 : Number(s.inclinePct) || 0,
-                }))
-                .filter(s => s.seconds > 0)
-            : ex.sets
-                .filter(s => s.weight !== '' && s.reps !== '' && !isNaN(Number(s.weight)) && !isNaN(Number(s.reps)))
-                .map(s => ({ weight: Number(s.weight), reps: Number(s.reps) })),
-        }))
-        .filter(ex => ex.sets.length > 0);
-
+    function commitEdit(cleaned) {
       if (cleaned.length === 0) {
         showToast('A workout needs at least one set — delete the session instead');
         return;
       }
-
       const idx = sessions.findIndex(s => s.id === session.id);
       if (idx !== -1) {
         sessions[idx] = { ...sessions[idx], exercises: cleaned, editedAt: new Date().toISOString() };
@@ -1596,6 +1721,22 @@ function renderSessionEditorCard(session) {
       renderHistory();
       showToast('Workout updated ✓');
       scheduleSync();
+    }
+
+    actions.querySelector('[data-role="save"]').addEventListener('click', () => {
+      // Same guard as End Workout — an edit that blanks a rep count shouldn't
+      // quietly delete the set it belonged to.
+      const audit = auditDraftExercises(draft.exercises);
+      const cleaned = audit.exercises.map((clean, i) => ({ ...draft.exercises[audit.keptIndexes[i]], ...clean }));
+
+      if (audit.issues.length > 0) {
+        showSaveGuard(audit.issues, {
+          onFix: () => {},
+          onDiscard: () => commitEdit(cleaned),
+        });
+        return;
+      }
+      commitEdit(cleaned);
     });
     body.appendChild(actions);
   }
