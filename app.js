@@ -2031,6 +2031,11 @@ importFileInput.addEventListener('change', (e) => {
    recent data every time instead of maintaining a fragile pending-queue. */
 const SYNC_WINDOW_DAYS = 180;
 const SYNC_MIN_INTERVAL_MS = 60 * 1000;
+// Apps Script can legitimately take a while on a full 180-day window, so this is
+// generous. It exists to stop "Syncing…" hanging forever, not to be strict.
+// `let` rather than `const` so the tests can shorten it — same testability seam
+// as reloadApp(). Nothing in the app reassigns it.
+let SYNC_TIMEOUT_MS = 60 * 1000;
 let syncInFlight = false;
 let lastSyncAttempt = 0;
 
@@ -2155,6 +2160,13 @@ async function syncNow({ silent = false } = {}) {
   lastSyncAttempt = Date.now();
   renderSyncStatus();
 
+  // A fetch with no timeout can hang forever, and the status line would sit on
+  // "Syncing…" with no way back short of force-quitting the app. Every write is
+  // an idempotent upsert, so giving up early costs nothing — the next sync
+  // re-sends the same window.
+  const abort = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = abort ? setTimeout(() => abort.abort(), SYNC_TIMEOUT_MS) : null;
+
   try {
     // text/plain keeps this a CORS "simple request", so the browser skips the
     // preflight OPTIONS that Apps Script cannot answer usefully.
@@ -2163,6 +2175,7 @@ async function syncNow({ silent = false } = {}) {
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
       body: JSON.stringify(buildSyncPayload()),
       redirect: 'follow',
+      signal: abort ? abort.signal : undefined,
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     let body = null;
@@ -2182,12 +2195,17 @@ async function syncNow({ silent = false } = {}) {
     return true;
   } catch (err) {
     console.error('Sync failed', err);
-    syncConfig.lastError = (err && err.message) || 'network error';
+    // An aborted request reports as "AbortError", which tells Rob nothing.
+    const timedOut = err && (err.name === 'AbortError' || err.code === 20);
+    syncConfig.lastError = timedOut
+      ? `no response after ${Math.round(SYNC_TIMEOUT_MS / 1000)}s`
+      : (err && err.message) || 'network error';
     saveSyncConfig(syncConfig);
     renderSyncStatus();
     if (!silent) showToast(`Sync failed: ${syncConfig.lastError}`);
     return false;
   } finally {
+    if (timer) clearTimeout(timer);
     syncInFlight = false;
     renderSyncStatus();
   }
