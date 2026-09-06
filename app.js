@@ -235,8 +235,99 @@ function exerciseVolume(exercise) {
   return setsToVolume(exercise.sets);
 }
 
+/* An assisted exercise logs how much the machine took OFF you, so its raw
+   weight x reps runs backwards: a week where you needed less help produces a
+   smaller number. Summed straight into a day total, getting stronger at
+   chin-ups can drag the whole day down even though every other lift held.
+
+   For SUMMED TOTALS ONLY, convert it to the load actually moved:
+   (body weight - assist) x reps. Per-exercise display is untouched — the
+   Charts tab and the history rows still show the assist trend as logged. */
+function invertedTrueLoad(sets, bodyWeight) {
+  return (sets || []).reduce(
+    // Clamp at zero: an assist heavier than you is a typo, and a negative
+    // contribution would drag the total down — the exact bug being fixed.
+    (sum, s) => sum + Math.max(0, bodyWeight - (Number(s.weight) || 0)) * (Number(s.reps) || 0),
+    0
+  );
+}
+
+// Resolved through the library by id first so it survives renames, falling back
+// to the name for sessions logged before exercises had stable ids.
+function isInvertedExercise(entry) {
+  if (!entry) return false;
+  if (entry.exerciseId) {
+    const lib = findExerciseById(entry.exerciseId);
+    if (lib) return !!lib.inverted;
+  }
+  return isInvertedExerciseName(entry.name);
+}
+
+/* Body weight to convert an assisted lift with.
+
+   The 7-day trailing average, not the single day's reading. Daily weight swings
+   2-4 lb on water alone, and at ~30 chin-up reps a session that noise is worth
+   ±100 lb of wobble in the total — enough to invent week-over-week "changes"
+   that are really just hydration. The average smooths that while still tracking
+   the real loss during the cut, which is the trend the total is meant to show.
+
+   The window ends on the session date and only ever looks backwards, so a later
+   weigh-in can never rewrite an earlier session's total. Rounded to 0.1 lb: the
+   scale's own precision, and no more than the input deserves.
+
+   Falls back to the most recent weigh-in before the window when the window is
+   empty, and returns null when there is nothing at or before the date at all —
+   a session from before Rob started weighing daily. Carrying a weight forward is
+   fine (body weight moves slowly); inventing one is not. */
+function bodyWeightBasisFor(date, days = 7) {
+  const window = bodyWeightAverage(days, date);
+  if (window) {
+    return { weight: Math.round(window.avg * 10) / 10, basis: 'average', count: window.count };
+  }
+  const prior = sortedBodyWeights().filter(w => w.date <= date);
+  if (prior.length === 0) return null;
+  const hit = prior[prior.length - 1];
+  return { weight: Number(hit.weight) || 0, basis: 'carried', date: hit.date, days };
+}
+
+/* Session total, plus an honest account of how it was reached. An assisted
+   exercise can only be converted to true load if a body weight is available;
+   when none is, it is LEFT OUT of the total rather than contributing an
+   upside-down number, and `note` says so. */
+function sessionVolumeDetail(session) {
+  const bw = bodyWeightBasisFor(session.date);
+  const excluded = [];
+  let total = 0;
+  let usedInverted = false;
+
+  (session.exercises || []).forEach(ex => {
+    if (exerciseIsCardio(ex)) return;              // cardio contributes nothing
+    if (!isInvertedExercise(ex)) {
+      total += setsToVolume(ex.sets);
+      return;
+    }
+    if (!bw) {
+      excluded.push(displayExerciseName(ex));
+      return;
+    }
+    total += invertedTrueLoad(ex.sets, bw.weight);
+    usedInverted = true;
+  });
+
+  // Only explain the total when it needed explaining. The normal path — an
+  // average over several recent weigh-ins — says nothing.
+  let note = null;
+  if (excluded.length) {
+    note = `${excluded.join(', ')} left out of the total — no body weight logged on or before this date.`;
+  } else if (usedInverted && bw.basis === 'carried') {
+    note = `Assisted work converted using body weight from ${fmtDateShort(bw.date)} (${bw.weight} lb) — no weigh-ins in the ${bw.days} days before this session.`;
+  }
+
+  return { total, note, excluded, bodyWeight: bw };
+}
+
 function sessionVolume(session) {
-  return session.exercises.reduce((sum, ex) => sum + exerciseVolume(ex), 0);
+  return sessionVolumeDetail(session).total;
 }
 
 // Total treadmill/bike time in a session, for the history card subtitle.
@@ -1535,7 +1626,8 @@ function renderHistory() {
       historyListEl.appendChild(renderSessionEditorCard(session));
       return;
     }
-    const vol = sessionVolume(session);
+    const volDetail = sessionVolumeDetail(session);
+    const vol = volDetail.total;
     const card = document.createElement('div');
     card.className = 'session-card';
     const isOpen = openSessionIds.has(session.id);
@@ -1565,6 +1657,7 @@ function renderHistory() {
             ${ex.notes ? `<div class="ex-notes">📝 ${escapeHtml(ex.notes)}</div>` : ''}
           </div>
         `; }).join('')}
+        ${volDetail.note ? `<div class="vol-note" data-role="vol-note">${escapeHtml(volDetail.note)}</div>` : ''}
         <div class="session-actions" style="justify-content:space-between;">
           <button class="btn btn-secondary btn-sm" data-role="edit">Edit</button>
           <button class="btn btn-danger btn-sm" data-role="delete">Delete Session</button>
