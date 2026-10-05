@@ -1644,9 +1644,15 @@ function renderHistory() {
       <div class="session-body ${isOpen ? 'open' : ''}" data-role="body">
         ${session.exercises.map(ex => {
           const cardio = exerciseIsCardio(ex);
+          // An assisted exercise reports the load it actually moved, matching the
+          // charts and the session total. The set detail below still reads as
+          // logged — that's the number to dial into the machine next week.
+          const trueSets = !cardio && isInvertedExercise(ex) ? trueLoadSets(ex.sets, session.date) : null;
           const right = cardio
             ? formatDuration(cardioSeconds(ex.sets))
-            : `${fmtNum(exerciseVolume(ex))} vol`;
+            : trueSets
+              ? `${fmtNum(setsToVolume(trueSets))} lifted`
+              : `${fmtNum(exerciseVolume(ex))} vol`;
           const detail = cardio
             ? escapeHtml(cardioSummary(ex.sets))
             : ex.sets.map(s => `${s.weight}×${s.reps}`).join('  ·  ');
@@ -2244,85 +2250,62 @@ const chartExerciseSelect = document.getElementById('chartExerciseSelect');
 const chartArea = document.getElementById('chartArea');
 let chartInstances = [];
 
-/* For an exercise flagged `inverted` (assisted machines), the logged weight is how
-   much the machine took OFF you, so every weight-based metric reads backwards:
-   a rising line means you needed more help. These entries relabel themselves and
-   flip "Peak" to "Best (lowest)" in that case. Reps are unaffected — more reps is
-   still more reps. */
+/* The four metrics every strength exercise is charted by. Assisted exercises
+   used to need inverted twins of these — "Assist Volume", "Least Assist Used",
+   a "lower is better" flag — because the logged number was the machine's help
+   rather than the load. Since v19 the SETS are converted to true load before
+   they reach these (see trueLoadSets), so one set of metrics, read the normal
+   way, covers everything. More is better, everywhere. */
 const CHART_METRICS = {
   volume: {
     label: 'Volume Load',
-    invertedLabel: 'Assist Volume',
     shortLabel: 'Vol',
-    betterIsLower: true,
     compute: setsToVolume,
     format: fmtNum,
   },
   avgWeight: {
     label: 'Average Weight',
-    invertedLabel: 'Average Assist',
     shortLabel: 'Avg Wt',
-    betterIsLower: true,
     compute: setsToAvgWeight,
     format: n => (Math.round(n * 10) / 10).toLocaleString(),
   },
   maxWeight: {
     label: 'Max Weight',
-    invertedLabel: 'Least Assist Used',
     shortLabel: 'Max Wt',
-    betterIsLower: true,
     compute: sets => sets.reduce((m, s) => Math.max(m, Number(s.weight) || 0), 0),
-    // The meaningful PR on an assisted machine is the LOWEST assistance you managed.
-    invertedCompute: sets => sets.reduce(
-      (m, s) => Math.min(m, Number(s.weight) || 0), Infinity),
     format: fmtNum,
   },
   maxReps: {
     label: 'Max Reps',
     shortLabel: 'Max Reps',
-    betterIsLower: false,
     compute: sets => sets.reduce((m, s) => Math.max(m, Number(s.reps) || 0), 0),
     format: n => Math.round(n).toLocaleString(),
   },
 };
 
-/* Cardio has no weight or reps, so it gets its own four metrics. Pace is
-   "lower is better" for the same reason assisted lifts are — a falling line
-   means you covered the same ground faster. */
+/* Cardio has no weight or reps, so it gets its own four metrics. */
 const CARDIO_CHART_METRICS = {
   minutes: {
     label: 'Duration (min)',
-    betterIsLower: false,
     compute: cardioMinutes,
     format: n => (Math.round(n * 10) / 10).toLocaleString(),
   },
   distance: {
     label: 'Distance (mi)',
-    betterIsLower: false,
     compute: cardioDistance,
     format: n => (Math.round(n * 100) / 100).toFixed(2),
   },
   speed: {
     label: 'Avg Speed (mph)',
-    betterIsLower: false,
     compute: cardioSpeedMph,
     format: n => (Math.round(n * 10) / 10).toFixed(1),
   },
   incline: {
     label: 'Avg Incline (%)',
-    betterIsLower: false,
     compute: cardioAvgIncline,
     format: n => (Math.round(n * 10) / 10).toFixed(1),
   },
 };
-
-function metricLabel(metric, inverted) {
-  return inverted && metric.invertedLabel ? metric.invertedLabel : metric.label;
-}
-
-function metricCompute(metric, inverted) {
-  return inverted && metric.invertedCompute ? metric.invertedCompute : metric.compute;
-}
 
 function setsToVolume(sets) {
   return sets.reduce((sum, s) => sum + (Number(s.weight) || 0) * (Number(s.reps) || 0), 0);
@@ -2337,6 +2320,27 @@ function setsToAvgWeight(sets) {
 
 // All sets logged for a given exercise (matched by library id when linked), grouped
 // by date so multiple sessions of the same exercise on the same day combine correctly.
+/* Rewrites one session's sets from "help received" into "load actually moved",
+   so the ordinary chart metrics can read them. Weight becomes
+   (body weight - assist), clamped at zero; reps are untouched.
+
+   Computed on read, never stored. The body-weight basis is a 7-day trailing
+   average that keeps filling as weigh-ins arrive, and a corrected weigh-in
+   should correct the charts with it — a value frozen at save time would be
+   stale the moment either changed. Same rule and same helper the session
+   totals use, so the two can never disagree.
+
+   Null when no weigh-in exists on or before that date: the session predates
+   the weigh-in habit and there is nothing honest to convert it with. */
+function trueLoadSets(sets, date) {
+  const bw = bodyWeightBasisFor(date);
+  if (!bw) return null;
+  return (sets || []).map(s => ({
+    weight: Math.max(0, bw.weight - (Number(s.weight) || 0)),
+    reps: Number(s.reps) || 0,
+  }));
+}
+
 function setsByDateFor(targetKey) {
   const byDate = new Map();
   sessions.forEach(s => {
@@ -2489,14 +2493,6 @@ function drawChartsFor(exerciseName) {
   if (!exerciseName) return;
   const targetKey = matchKeyForName(exerciseName);
 
-  const byDate = setsByDateFor(targetKey);
-  const dates = [...byDate.keys()].sort((a, b) => a.localeCompare(b));
-
-  if (dates.length === 0) {
-    chartArea.innerHTML = `<div class="empty-state">No logged sets yet for this exercise.</div>`;
-    return;
-  }
-
   // Cardio exercises get an entirely different metric family — minutes and miles
   // instead of weight and reps.
   const cardio = isCardioExerciseName(exerciseName);
@@ -2504,20 +2500,44 @@ function drawChartsFor(exerciseName) {
   const metricKeys = Object.keys(METRICS);
   const inverted = !cardio && isInvertedExerciseName(exerciseName);
 
+  let byDate = setsByDateFor(targetKey);
+
+  /* Convert assist to true load up front, then let the ordinary metrics run.
+     A session with no body weight on or before it can't be converted and is
+     dropped rather than plotted upside down — `unconverted` counts those so
+     the gap is explained instead of silently swallowed. */
+  let unconverted = 0;
+  if (inverted) {
+    const converted = new Map();
+    for (const [d, sets] of byDate) {
+      const t = trueLoadSets(sets, d);
+      if (t) converted.set(d, t);
+      else unconverted++;
+    }
+    byDate = converted;
+  }
+
+  const dates = [...byDate.keys()].sort((a, b) => a.localeCompare(b));
+
+  if (dates.length === 0) {
+    chartArea.innerHTML = inverted && unconverted
+      ? `<div class="empty-state">No body weight logged on or before any of these sessions, so the load you actually moved can't be worked out. Log a weigh-in and these will appear.</div>`
+      : `<div class="empty-state">No logged sets yet for this exercise.</div>`;
+    return;
+  }
+
   chartArea.innerHTML = `
     <div class="chart-session-count">${dates.length} session${dates.length !== 1 ? 's' : ''} logged</div>
-    ${inverted ? `<div class="editing-banner">Assisted exercise — the number you log is how much the machine helps, so <strong>a falling line is progress</strong>.</div>` : ''}
+    ${inverted ? `<div class="assist-banner">Assisted exercise — you log the machine's help, but these charts show <strong>the weight you actually moved</strong> (body weight &minus; assist). Up is progress.${unconverted ? ` ${unconverted} earlier session${unconverted !== 1 ? 's' : ''} hidden — no weigh-in on or before ${unconverted !== 1 ? 'those dates' : 'that date'}.` : ''}</div>` : ''}
     ${metricKeys.map(key => {
       const m = METRICS[key];
-      const lower = inverted && m.betterIsLower;
       return `
       <div class="chart-card">
         <div class="chart-card-head">
           <div>
-            <div class="chart-card-title">${metricLabel(m, inverted)}</div>
-            ${lower ? '<div class="chart-card-note">lower is better</div>' : ''}
+            <div class="chart-card-title">${m.label}</div>
           </div>
-          <div class="chart-card-stats">Latest <strong id="latest-${key}">-</strong> &middot; ${lower ? 'Best' : 'Peak'} <strong id="peak-${key}">-</strong></div>
+          <div class="chart-card-stats">Latest <strong id="latest-${key}">-</strong> &middot; Peak <strong id="peak-${key}">-</strong></div>
         </div>
         <div class="chart-wrap-sm"><canvas id="chart-${key}"></canvas></div>
       </div>
@@ -2531,14 +2551,11 @@ function drawChartsFor(exerciseName) {
 
   metricKeys.forEach(key => {
     const metric = METRICS[key];
-    const lower = inverted && metric.betterIsLower;
-    const computeFn = metricCompute(metric, inverted);
-    const points = dates.map(d => [d, computeFn(byDate.get(d))]);
+    const points = dates.map(d => [d, metric.compute(byDate.get(d))]);
     const values = points.map(p => p[1]).map(v => (isFinite(v) ? v : 0));
 
     document.getElementById(`latest-${key}`).textContent = metric.format(values[values.length - 1]);
-    document.getElementById(`peak-${key}`).textContent =
-      metric.format(lower ? Math.min(...values) : Math.max(...values));
+    document.getElementById(`peak-${key}`).textContent = metric.format(Math.max(...values));
 
     if (!chartJsAvailable) return;
 
@@ -2550,7 +2567,7 @@ function drawChartsFor(exerciseName) {
       data: {
         labels: points.map(p => fmtDate(p[0])),
         datasets: [{
-          label: `${exerciseName} — ${metricLabel(metric, inverted)}`,
+          label: `${exerciseName} — ${metric.label}`,
           data: values,
           borderColor: '#5b8cff',
           backgroundColor: 'rgba(91,140,255,0.15)',
