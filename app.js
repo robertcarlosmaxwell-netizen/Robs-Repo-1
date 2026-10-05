@@ -2064,9 +2064,15 @@ function buildSyncPayload() {
     .sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id))
     .forEach(s => {
       const routineName = displayRoutineName(s) || '';
+      // Resolved once per session — the same 7-day trailing average the rest of
+      // the app uses. null when no weigh-in exists at or before the session
+      // date, in which case the true-load columns go out blank rather than
+      // carrying an invented number into the sheet.
+      const bw = bodyWeightBasisFor(s.date);
       s.exercises.forEach((ex, exIdx) => {
         const exName = displayExerciseName(ex);
         const cardio = exerciseIsCardio(ex);
+        const inverted = !cardio && isInvertedExercise(ex);
         ex.sets.forEach((set, setIdx) => {
           // Same key scheme for both, so a set that changes kind can't end up
           // duplicated across the two tabs.
@@ -2088,15 +2094,25 @@ function buildSyncPayload() {
               notes: ex.notes || '',
             });
           } else {
+            const weight = Number(set.weight) || 0;
+            const reps = Number(set.reps) || 0;
             rows.push({
               key,
               date: s.date,
               routine: routineName,
               exercise: exName,
               set: setIdx + 1,
-              weight: Number(set.weight) || 0,
-              reps: Number(set.reps) || 0,
-              volume: (Number(set.weight) || 0) * (Number(set.reps) || 0),
+              weight,
+              reps,
+              // Deliberately RAW — assist as logged. Workouts column G keeps
+              // its weight x reps invariant for every row, inverted or not.
+              volume: weight * reps,
+              // Workouts columns J and K. Inverted exercises only, and only
+              // when a body weight resolved; blank otherwise so the sheet never
+              // implies a conversion it couldn't make. Same clamping as
+              // invertedTrueLoad() — an assist heavier than you is a typo.
+              bodyWeightUsed: inverted && bw ? bw.weight : '',
+              trueLoad: inverted && bw ? Math.max(0, bw.weight - weight) * reps : '',
               notes: ex.notes || '',
             });
           }
