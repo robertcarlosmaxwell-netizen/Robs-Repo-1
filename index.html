@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, interactive-widget=resizes-content">
 <title>Workout Tracker</title>
 
 <!-- Home screen / PWA behavior -->
@@ -744,7 +744,10 @@
     padding:3px 12px;
   }
 
-  #workoutScreen{padding-bottom:8px;}
+  /* The End Workout button is fixed above the tab bar, so the last set row would
+     otherwise sit underneath it. --endbtn-h is measured at runtime by
+     syncLayoutVars() and is 0px whenever the button is hidden. */
+  #workoutScreen{padding-bottom:calc(8px + var(--endbtn-h, 0px));}
 
   /* Says how a session total was reached when an assisted exercise needed a
      body weight that wasn't logged that day. Only appears when it applies. */

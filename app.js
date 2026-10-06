@@ -46,11 +46,25 @@ function loadActiveWorkout() {
   }
 }
 
+/* Crash-recovery snapshot of the in-progress workout.
+
+   localStorage.setItem is synchronous and disk-backed. This used to run once a
+   SECOND off the timer tick — ~2,700 writes across a 45-minute session, almost
+   all of them byte-identical to the one before. Now the serialised form is
+   compared first and the write is skipped when nothing changed, so a workout
+   costs roughly one write per thing Rob actually types. */
+let lastActiveWorkoutJson = null;
+
 function saveActiveWorkout(activeWorkout, draftExercises) {
-  localStorage.setItem(ACTIVE_WORKOUT_KEY, JSON.stringify({ activeWorkout, draftExercises }));
+  const json = JSON.stringify({ activeWorkout, draftExercises });
+  if (json === lastActiveWorkoutJson) return false;
+  localStorage.setItem(ACTIVE_WORKOUT_KEY, json);
+  lastActiveWorkoutJson = json;
+  return true;
 }
 
 function clearActiveWorkoutStorage() {
+  lastActiveWorkoutJson = null;
   localStorage.removeItem(ACTIVE_WORKOUT_KEY);
 }
 
@@ -543,6 +557,14 @@ let timerInterval = null;
 function syncLayoutVars() {
   const tabbarEl = document.querySelector('nav.tabbar');
   if (tabbarEl) document.documentElement.style.setProperty('--tabbar-h', tabbarEl.offsetHeight + 'px');
+  // The End Workout button is position:fixed above the tab bar, so the workout
+  // screen needs that much clearance or the last set row sits underneath it.
+  // offsetHeight is 0 while the button is hidden, which is exactly right.
+  const endBtn = document.getElementById('endWorkoutBtn');
+  if (endBtn) {
+    const h = endBtn.offsetHeight;
+    document.documentElement.style.setProperty('--endbtn-h', (h ? h + 24 : 0) + 'px');
+  }
 }
 window.addEventListener('resize', syncLayoutVars);
 window.addEventListener('load', syncLayoutVars);
@@ -738,8 +760,16 @@ autocompleteBox.addEventListener('mousedown', (e) => {
   hideAutocomplete();
 });
 
-window.addEventListener('scroll', hideAutocomplete, true);
-window.addEventListener('resize', hideAutocomplete);
+/* Dismiss the suggestion box when the page moves under it.
+
+   Both of these used to call hideAutocomplete() unconditionally, which wrote to
+   the DOM twice on EVERY scroll event even with no box open — and the scroll
+   listener was non-passive, so iOS had to wait for that JS before it would move
+   the page. That is a large part of why scrolling could feel stuck mid-workout.
+   Now: passive (scrolling never waits on us) and an early-out (no DOM work in
+   the normal case, which is that nothing is open). */
+window.addEventListener('scroll', () => { if (acInput) hideAutocomplete(); }, { capture: true, passive: true });
+window.addEventListener('resize', () => { if (acInput) hideAutocomplete(); });
 
 function escapeHtml(str) {
   const div = document.createElement('div');
@@ -1091,13 +1121,22 @@ function updateTimerDisplay() {
   workoutTimerEl.textContent = formatDuration(elapsed);
 }
 
+// The clock still updates every second — that's one textContent write, free.
+// The snapshot is throttled on top of it; the real safety net is the save on
+// hide/pagehide below, which fires at the one moment iOS might kill the page.
+const AUTOSAVE_EVERY_TICKS = 5;
+let autosaveTick = 0;
+
 function startTimerInterval() {
   stopTimerInterval();
+  autosaveTick = 0;
   updateTimerDisplay();
   timerInterval = setInterval(() => {
     updateTimerDisplay();
-    // periodic autosave so a locked/backgrounded/reloaded phone doesn't lose progress
-    if (activeWorkout) saveActiveWorkout(activeWorkout, draftExercises);
+    if (activeWorkout && ++autosaveTick >= AUTOSAVE_EVERY_TICKS) {
+      autosaveTick = 0;
+      saveActiveWorkout(activeWorkout, draftExercises);
+    }
   }, 1000);
 }
 
@@ -2259,6 +2298,14 @@ document.getElementById('syncNowBtn').addEventListener('click', () => syncNow())
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') scheduleSync();
+  // Backgrounding is when iOS is most likely to kill the page, so snapshot now
+  // rather than relying on the next periodic tick (which may never come).
+  else if (activeWorkout) saveActiveWorkout(activeWorkout, draftExercises);
+});
+
+// pagehide covers the cases visibilitychange misses — navigation and teardown.
+window.addEventListener('pagehide', () => {
+  if (activeWorkout) saveActiveWorkout(activeWorkout, draftExercises);
 });
 
 /* ---------- CHARTS VIEW ---------- */
