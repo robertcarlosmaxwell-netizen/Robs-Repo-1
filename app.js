@@ -5,6 +5,7 @@ const ACTIVE_WORKOUT_KEY = 'wt_active_workout_v1';
 const EXERCISE_LIBRARY_KEY = 'wt_exercise_library_v1';
 const BODYWEIGHT_KEY = 'wt_bodyweight_v1';
 const SYNC_CONFIG_KEY = 'wt_sync_config_v1';
+const DELETED_SESSIONS_KEY = 'wt_deleted_sessions_v1';
 
 function loadSessions() {
   try {
@@ -120,6 +121,23 @@ function loadSyncConfig() {
 
 function saveSyncConfig(cfg) {
   localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(cfg));
+}
+
+/* Ids of workouts deleted on the phone whose rows the spreadsheet may still
+   hold. Sent with every sync, and forgotten only once the script confirms it
+   pruned them — a script too old to prune just leaves them queued. */
+function loadDeletedSessionIds() {
+  try {
+    const list = JSON.parse(localStorage.getItem(DELETED_SESSIONS_KEY) || '[]');
+    return Array.isArray(list) ? list.filter(id => typeof id === 'string') : [];
+  } catch (e) {
+    console.error('Failed to load deleted session ids', e);
+    return [];
+  }
+}
+
+function saveDeletedSessionIds(list) {
+  localStorage.setItem(DELETED_SESSIONS_KEY, JSON.stringify(list));
 }
 
 // Normalize routines to { id, name, exercises: [{ name, sets, exerciseId }] }.
@@ -558,6 +576,7 @@ let routines = loadRoutines().map(normalizeRoutine);
 let exerciseLibrary = normalizeExerciseLibrary(loadExerciseLibrary());
 let bodyWeights = loadBodyWeights();
 let syncConfig = loadSyncConfig();
+let deletedSessionIds = loadDeletedSessionIds();
 let editingSessionId = null;
 let currentView = 'log';
 let openSessionIds = new Set();
@@ -1746,6 +1765,10 @@ function renderHistory() {
       if (confirm(`Delete workout from ${fmtDate(session.date)}? This can't be undone.`)) {
         sessions = sessions.filter(s => s.id !== session.id);
         saveSessions(sessions);
+        if (!deletedSessionIds.includes(session.id)) {
+          deletedSessionIds.push(session.id);
+          saveDeletedSessionIds(deletedSessionIds);
+        }
         refreshExerciseDatalist();
         renderHistory();
         scheduleSync({ changed: true });
@@ -2027,6 +2050,13 @@ function applyImportedBackup(data) {
   const existingSessionIds = new Set(sessions.map(s => s.id));
   const newSessions = data.sessions.filter(s => s && s.id && !existingSessionIds.has(s.id));
   sessions = sessions.concat(newSessions);
+  // A restored workout is no longer deleted — don't let a queued deletion
+  // remove its rows from the sheet.
+  const restored = new Set(newSessions.map(s => s.id));
+  if (deletedSessionIds.some(id => restored.has(id))) {
+    deletedSessionIds = deletedSessionIds.filter(id => !restored.has(id));
+    saveDeletedSessionIds(deletedSessionIds);
+  }
 
   const existingRoutineIds = new Set(routines.map(r => r.id));
   const newRoutines = data.routines.map(normalizeRoutine).filter(r => r && r.id && !existingRoutineIds.has(r.id));
@@ -2071,6 +2101,7 @@ importFileInput.addEventListener('change', (e) => {
       populateRoutineSelect();
       renderHistory();
       renderBodyWeightCard();
+      scheduleSync({ changed: true });
       showToast(`Restored ${added.sessions} workout${added.sessions !== 1 ? 's' : ''}, ${added.routines} routine${added.routines !== 1 ? 's' : ''}, ${added.exercises} exercise${added.exercises !== 1 ? 's' : ''}, ${added.weights} weigh-in${added.weights !== 1 ? 's' : ''}`);
     } catch (err) {
       console.error(err);
@@ -2117,8 +2148,8 @@ function buildSyncPayload() {
   const since = syncWindowStart();
   const rows = [];
   const cardioRows = [];
-  sessions
-    .filter(s => s.date >= since)
+  const inWindow = sessions.filter(s => s.date >= since);
+  inWindow
     .sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id))
     .forEach(s => {
       const routineName = displayRoutineName(s) || '';
@@ -2185,6 +2216,11 @@ function buildSyncPayload() {
     weights: sortedBodyWeights().map(w => ({ id: w.id, date: w.date, weight: Number(w.weight) || 0 })),
     sets: rows,
     cardio: cardioRows,
+    // Every session sent in full, so the script can drop rows an edit removed.
+    // Listed explicitly rather than read off the rows: a session whose last
+    // set was deleted has no rows left to name it.
+    sessionIds: inWindow.map(s => s.id),
+    deletedSessionIds: [...deletedSessionIds],
   };
 }
 
@@ -2253,10 +2289,11 @@ async function syncNow({ silent = false } = {}) {
   try {
     // text/plain keeps this a CORS "simple request", so the browser skips the
     // preflight OPTIONS that Apps Script cannot answer usefully.
+    const payload = buildSyncPayload();
     const res = await fetch(syncConfig.url, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(buildSyncPayload()),
+      body: JSON.stringify(payload),
       redirect: 'follow',
       signal: abort ? abort.signal : undefined,
     });
@@ -2265,13 +2302,21 @@ async function syncNow({ silent = false } = {}) {
     try { body = JSON.parse(await res.text()); } catch (e) { /* non-JSON is still a delivery */ }
     if (body && body.ok === false) throw new Error(body.error || 'rejected by script');
 
+    // `removed` is only reported by a script that prunes. Until it is, keep the
+    // deletions queued rather than dropping them on a script that ignored them.
+    if (body && body.counts && typeof body.counts.removed === 'number' && payload.deletedSessionIds.length) {
+      const done = new Set(payload.deletedSessionIds);
+      deletedSessionIds = deletedSessionIds.filter(id => !done.has(id));
+      saveDeletedSessionIds(deletedSessionIds);
+    }
+
     syncConfig.lastSyncedAt = new Date().toISOString();
     syncConfig.lastError = null;
     saveSyncConfig(syncConfig);
     renderSyncStatus();
     if (!silent) {
       const n = body && body.counts
-        ? ` (${body.counts.weights} weigh-ins, ${body.counts.sets} sets)`
+        ? ` (${body.counts.weights} weigh-ins, ${body.counts.sets} sets${body.counts.removed ? `, ${body.counts.removed} old rows removed` : ''})`
         : '';
       showToast(`Synced ✓${n}`);
     }
