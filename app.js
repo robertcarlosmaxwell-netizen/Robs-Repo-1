@@ -376,8 +376,16 @@ function displayExerciseName(entry) {
   return entry.name;
 }
 
+/* Two cases used to split one exercise's history in two:
+   - logged before it was in the library (no exerciseId), then added later —
+     old sessions keyed by name, new ones by id;
+   - linked to a library entry that has since been deleted — the id points at
+     nothing, so the name you see could never be matched back to it.
+   So an id only counts while its library entry exists, and anything else
+   resolves by name, through the library, exactly like matchKeyForName. */
 function exerciseMatchKey(entry) {
-  return entry.exerciseId ? 'id:' + entry.exerciseId : 'name:' + entry.name.trim().toLowerCase();
+  if (entry.exerciseId && findExerciseById(entry.exerciseId)) return 'id:' + entry.exerciseId;
+  return matchKeyForName(entry.name);
 }
 
 // Resolve a typed/selected exercise name to the same key an already-linked entry
@@ -392,8 +400,12 @@ function allExerciseNames(sessions) {
   const sorted = [...sessions].sort((a, b) => a.date.localeCompare(b.date));
   sorted.forEach(s => {
     s.exercises.forEach(ex => {
-      const display = displayExerciseName(ex).trim();
-      if (display) seen.set(exerciseMatchKey(ex), display);
+      const key = exerciseMatchKey(ex);
+      // Unlinked sessions merged into a library exercise carry whatever casing
+      // was typed at the time; the library's spelling wins.
+      const lib = key.startsWith('id:') ? findExerciseById(key.slice(3)) : null;
+      const display = (lib ? lib.name : displayExerciseName(ex) || '').trim();
+      if (display) seen.set(key, display);
     });
   });
   return [...seen.values()].sort((a, b) => a.localeCompare(b));
@@ -678,7 +690,7 @@ document.getElementById('bwSaveBtn').addEventListener('click', () => {
   renderBodyWeightCard();
   if (currentView === 'charts') renderCharts();
   showToast(action === 'updated' ? 'Weigh-in updated ✓' : 'Weigh-in logged ✓');
-  scheduleSync();
+  scheduleSync({ changed: true });
 });
 
 function refreshExerciseDatalist() {
@@ -1152,7 +1164,11 @@ document.getElementById('startWorkoutBtn').addEventListener('click', () => {
 
   draftExercises = routine
     ? routine.exercises.map(re => {
-        const de = newDraftExercise(re.name);
+        // The routine stores the name as it was when the routine was saved. Use
+        // the library's current name, or a renamed exercise starts the workout
+        // under its old name — blank PREV, and an offer to add the old name to
+        // the library as if it were new.
+        const de = newDraftExercise(displayExerciseName(re));
         // A routine's "sets" count is a strength idea; cardio gets a single bout
         // unless you add intervals during the workout.
         if (de.kind === 'cardio') return de;
@@ -1363,7 +1379,7 @@ function finishWorkout(cleanExercises) {
     saveSessions(sessions);
     refreshExerciseDatalist();
     showToast(`Workout saved ✓ (${formatDuration(durationSeconds)})`);
-    scheduleSync();
+    scheduleSync({ changed: true });
   } else {
     showToast('Workout ended — no sets logged, nothing saved');
   }
@@ -1429,7 +1445,9 @@ function renderRoutineList() {
 
 function openRoutineEditor(routine) {
   draftRoutine = routine
-    ? { id: routine.id, name: routine.name, exercises: routine.exercises.map(e => ({ ...e })) }
+    // Current library names, for the same reason as Start Workout: saving is
+    // relinked by name, so an old name here would save as a "new" exercise.
+    ? { id: routine.id, name: routine.name, exercises: routine.exercises.map(e => ({ ...e, name: displayExerciseName(e) })) }
     : { id: null, name: '', exercises: [{ name: '', sets: '', exerciseId: null }] };
   routineNameInput.value = draftRoutine.name;
   renderRoutineExerciseInputs();
@@ -1730,7 +1748,7 @@ function renderHistory() {
         saveSessions(sessions);
         refreshExerciseDatalist();
         renderHistory();
-        scheduleSync();
+        scheduleSync({ changed: true });
       }
     });
 
@@ -1858,7 +1876,7 @@ function renderSessionEditorCard(session) {
       refreshExerciseDatalist();
       renderHistory();
       showToast('Workout updated ✓');
-      scheduleSync();
+      scheduleSync({ changed: true });
     }
 
     actions.querySelector('[data-role="save"]').addEventListener('click', () => {
@@ -2075,7 +2093,8 @@ importFileInput.addEventListener('change', (e) => {
    re-sending the same data is harmless. That means we can just re-send a window of
    recent data every time instead of maintaining a fragile pending-queue. */
 const SYNC_WINDOW_DAYS = 180;
-const SYNC_MIN_INTERVAL_MS = 60 * 1000;
+// `let` for the same reason as SYNC_TIMEOUT_MS below: the tests shorten it.
+let SYNC_MIN_INTERVAL_MS = 60 * 1000;
 // Apps Script can legitimately take a while on a full 180-day window, so this is
 // generous. It exists to stop "Syncing…" hanging forever, not to be strict.
 // `let` rather than `const` so the tests can shorten it — same testability seam
@@ -2219,6 +2238,9 @@ async function syncNow({ silent = false } = {}) {
 
   syncInFlight = true;
   lastSyncAttempt = Date.now();
+  // This request carries everything, so a queued follow-up has nothing left to
+  // send. A save that lands while it's in flight queues a fresh one.
+  if (syncFollowUpTimer) { clearTimeout(syncFollowUpTimer); syncFollowUpTimer = null; }
   renderSyncStatus();
 
   // A fetch with no timeout can hang forever, and the status line would sit on
@@ -2269,14 +2291,42 @@ async function syncNow({ silent = false } = {}) {
     if (timer) clearTimeout(timer);
     syncInFlight = false;
     renderSyncStatus();
+    if (syncAgainAfterFlight) {
+      syncAgainAfterFlight = false;
+      scheduleSync({ changed: true });   // queues for when the window reopens
+    }
   }
 }
 
-// Fire-and-forget background sync, rate limited so saving three things in a row
-// doesn't fire three requests.
-function scheduleSync() {
+/* Fire-and-forget background sync, rate limited so saving three things in a row
+   doesn't fire three requests.
+
+   The limit used to DROP a blocked call. Opening the app syncs, so a weigh-in
+   logged in the first minute — the normal morning — never left the phone until
+   the next launch. Same if a save landed mid-sync, after the payload was built.
+   Now a blocked call that carries new data (`changed`) queues one follow-up
+   for when the window reopens; a blocked foreground call is still just dropped,
+   since nothing new needs sending. */
+let syncFollowUpTimer = null;
+let syncAgainAfterFlight = false;   // a save landed after the in-flight payload was built
+
+function scheduleSync({ changed = false } = {}) {
   if (!syncConfig.url) return;
-  if (Date.now() - lastSyncAttempt < SYNC_MIN_INTERVAL_MS) return;
+  if (syncInFlight) {
+    // syncNow's finally picks this up — no polling while a slow request runs.
+    if (changed) syncAgainAfterFlight = true;
+    return;
+  }
+  const wait = SYNC_MIN_INTERVAL_MS - (Date.now() - lastSyncAttempt);
+  if (wait > 0) {
+    if (changed && !syncFollowUpTimer) {
+      syncFollowUpTimer = setTimeout(() => {
+        syncFollowUpTimer = null;
+        scheduleSync({ changed: true });
+      }, wait);
+    }
+    return;
+  }
   syncNow({ silent: true });
 }
 
@@ -2558,7 +2608,12 @@ function drawChartsFor(exerciseName) {
 
   // Cardio exercises get an entirely different metric family — minutes and miles
   // instead of weight and reps.
-  const cardio = isCardioExerciseName(exerciseName);
+  // The library decides when the exercise is in it; otherwise (never added, or
+  // deleted since) the kind each session recorded when it was logged.
+  const lib = findExerciseByName(exerciseName);
+  const cardio = lib
+    ? lib.kind === 'cardio'
+    : sessions.some(s => s.exercises.some(ex => exerciseMatchKey(ex) === targetKey && exerciseIsCardio(ex)));
   const METRICS = cardio ? CARDIO_CHART_METRICS : CHART_METRICS;
   const metricKeys = Object.keys(METRICS);
   const inverted = !cardio && isInvertedExerciseName(exerciseName);
