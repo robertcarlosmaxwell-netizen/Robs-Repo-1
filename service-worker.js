@@ -1,7 +1,7 @@
 // Bump this version string any time index.html/app.js/manifest.json/icons change.
 // The browser re-installs the service worker whenever this file's bytes change, which
 // is what actually pushes updated app files out to people who already installed the app.
-const CACHE_NAME = 'workout-tracker-v24';
+const CACHE_NAME = 'workout-tracker-v25';
 const ASSETS = [
   './',
   './index.html',
@@ -9,10 +9,9 @@ const ASSETS = [
   './manifest.json',
   './icons/icon-192.png',
   './icons/icon-512.png',
-];
-const CDN_ASSETS = [
-  'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js',
-  'https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js',
+  // Shipped with the app rather than pre-cached from a CDN, so it's held to the
+  // same all-or-nothing install rule as everything else here.
+  './vendor/chart.umd.js',
 ];
 
 self.addEventListener('install', (event) => {
@@ -32,8 +31,6 @@ self.addEventListener('install', (event) => {
         if (!res || !res.ok) throw new Error(`${url}: HTTP ${res && res.status}`);
         await cache.put(url, res);
       }));
-      // Cache the charting library separately so one failure doesn't block the app shell.
-      await Promise.all(CDN_ASSETS.map((url) => cache.add(url).catch(() => {})));
     })
   );
   self.skipWaiting();

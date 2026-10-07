@@ -994,14 +994,16 @@
   <div class="toast" id="toast"></div>
 </div>
 
-<datalist id="exerciseNames"></datalist>
 <div id="autocompleteBox" class="autocomplete-box"></div>
 
 <script>
-  // Chart.js is loaded from a CDN. If the primary CDN is unreachable (network hiccup,
-  // ad/content blocker, regional block), automatically try a couple of alternates
-  // before giving up. This only needs to finish before the user opens the Charts tab,
-  // so loading it this way (instead of a single blocking <script src>) is safe.
+  // Chart.js ships with the app (vendor/, v4.4.4 from npm, MIT) and is cached by the
+  // service worker with everything else, so charts work offline from the first
+  // launch. It used to come from CDNs only — and two of the three URLs had been
+  // returning 404, so every load was quietly riding on the last fallback.
+  // jsDelivr stays as a backstop in case the local file is somehow missing.
+  // Loaded this way rather than a blocking <script src> because it's only needed
+  // once the Charts tab opens; app.js listens for 'chartjs-ready'.
   (function loadChartJs(urls) {
     if (!urls.length) return;
     const s = document.createElement('script');
@@ -1010,9 +1012,8 @@
     s.onerror = () => loadChartJs(urls.slice(1));
     document.head.appendChild(s);
   })([
-    'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js',
-    'https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js',
-    'https://unpkg.com/chart.js@4.4.4/dist/chart.umd.min.js',
+    'vendor/chart.umd.js',
+    'https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.js',
   ]);
 </script>
 <script src="app.js"></script>

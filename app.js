@@ -160,10 +160,16 @@ function normalizeRoutine(r) {
 // takes off you. Without this the charts read exactly backwards for those lifts.
 // `kind` is 'strength' (weight x reps) or 'cardio' (time / distance / incline).
 // Anything saved before cardio existed has no kind and defaults to strength.
+// The one shape every library entry has. New entries are built here too, so an
+// exercise added mid-session looks the same as one loaded from storage.
+function newLibraryEntry(name) {
+  return { id: uid(), name, inverted: false, kind: 'strength' };
+}
+
 function normalizeExerciseLibrary(list) {
   return (list || []).map(e => (
     typeof e === 'string'
-      ? { id: uid(), name: e, inverted: false, kind: 'strength' }
+      ? newLibraryEntry(e)
       : { ...e, inverted: !!e.inverted, kind: e.kind === 'cardio' ? 'cardio' : 'strength' }
   ));
 }
@@ -251,11 +257,25 @@ function uid() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
 
+/* Dates are yyyy-mm-dd keys in the phone's LOCAL calendar. Two rules keep them
+   honest:
+   - A Date becomes a key through its local parts (localDateKey), never
+     toISOString(), which is UTC — a few hours either side of midnight that's
+     the wrong day.
+   - Day arithmetic happens on keys (addDaysKey), in UTC where there's no DST,
+     so "7 days back" is always 7 calendar days. */
+function localDateKey(d) {
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+
+function addDaysKey(key, n) {
+  const d = new Date(key + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
 function todayStr() {
-  const d = new Date();
-  const off = d.getTimezoneOffset();
-  const local = new Date(d.getTime() - off * 60000);
-  return local.toISOString().slice(0, 10);
+  return localDateKey(new Date());
 }
 
 /* ---------- Volume calculations ----------
@@ -475,12 +495,11 @@ function promptAddNewExercises(names) {
 
     if (confirm(msg)) {
       newOnes.forEach(n => {
-        const entry = { id: uid(), name: n };
+        const entry = newLibraryEntry(n);
         exerciseLibrary.push(entry);
         linked.set(n.toLowerCase(), entry.id);
       });
       saveExerciseLibrary(exerciseLibrary);
-      refreshExerciseDatalist();
     }
   }
 
@@ -535,8 +554,23 @@ function isInvertedExerciseName(name) {
 }
 
 /* ---------- Body weight helpers ---------- */
+/* Called for every History card and every chart point, so the sort is kept
+   until the list actually changes. Adding a weigh-in grows the array and an
+   import replaces it, either of which re-sorts; correcting a weight in place
+   changes neither date nor order, and the cached array holds the same objects,
+   so it sees the new value anyway. Callers must not mutate the result. */
+let sortedWeightsCache = { src: null, len: -1, list: [] };
+
 function sortedBodyWeights() {
-  return [...bodyWeights].sort((a, b) => a.date.localeCompare(b.date));
+  const c = sortedWeightsCache;
+  if (c.src !== bodyWeights || c.len !== bodyWeights.length) {
+    sortedWeightsCache = {
+      src: bodyWeights,
+      len: bodyWeights.length,
+      list: [...bodyWeights].sort((a, b) => a.date.localeCompare(b.date)),
+    };
+  }
+  return sortedWeightsCache.list;
 }
 
 function bodyWeightFor(date) {
@@ -561,9 +595,7 @@ function upsertBodyWeight(date, weight) {
 // Rolling average over the last `days` calendar days that actually have entries.
 // Daily weight swings 2-4 lb on water alone; the average is the only readable signal.
 function bodyWeightAverage(days = 7, endDate = todayStr()) {
-  const end = new Date(endDate + 'T00:00:00');
-  const start = new Date(end.getTime() - (days - 1) * 86400000);
-  const startStr = start.toISOString().slice(0, 10);
+  const startStr = addDaysKey(endDate, -(days - 1));
   const inWindow = bodyWeights.filter(w => w.date >= startStr && w.date <= endDate);
   if (inWindow.length === 0) return null;
   const sum = inWindow.reduce((acc, w) => acc + (Number(w.weight) || 0), 0);
@@ -662,7 +694,6 @@ function showToast(msg) {
 /* ---------- LOG VIEW ---------- */
 const sessionDateInput = document.getElementById('sessionDate');
 const exerciseListEl = document.getElementById('exerciseList');
-const exerciseNamesDatalist = document.getElementById('exerciseNames');
 
 sessionDateInput.value = todayStr();
 
@@ -720,18 +751,13 @@ document.getElementById('bwSaveBtn').addEventListener('click', () => {
   scheduleSync({ changed: true });
 });
 
-function refreshExerciseDatalist() {
-  exerciseNamesDatalist.innerHTML = knownExerciseNames()
-    .map(n => `<option value="${escapeHtml(n)}">`).join('');
-}
-
 /* ---------- Exercise name autocomplete ----------
    Native <datalist>/list="" suggestions are unreliable on iOS Safari (long-standing
    rendering bugs, and a fresh regression in iOS 26), which is why typing an exercise
    name on the Workout/Routines tabs wasn't showing suggestions. This drives its own
    lightweight dropdown instead, via event delegation so it keeps working across
-   re-renders. The list="exerciseNames" attribute stays in the markup too — harmless,
-   and still gives desktop browsers a native fallback. */
+   re-renders. The old <datalist> is gone entirely: on desktop it drew a second,
+   native suggestion list on top of this one. */
 const autocompleteBox = document.getElementById('autocompleteBox');
 const AUTOCOMPLETE_SELECTOR = '[data-role="ex-name"], [data-role="rex-name"]';
 let acInput = null;
@@ -1040,7 +1066,7 @@ function renderExerciseList() {
     const head = document.createElement('div');
     head.className = 'exercise-block-head';
     head.innerHTML = `
-      <input type="text" placeholder="Exercise name (e.g. Bench Press)" list="exerciseNames"
+      <input type="text" placeholder="Exercise name (e.g. Bench Press)"
         value="${escapeHtml(ex.name)}" data-role="ex-name">
       <button class="remove-x" data-role="remove-ex" title="Remove exercise">✕</button>
     `;
@@ -1416,7 +1442,6 @@ function finishWorkout(cleanExercises) {
       endedAt: new Date().toISOString(),
     });
     saveSessions(sessions);
-    refreshExerciseDatalist();
     showToast(`Workout saved ✓ (${formatDuration(durationSeconds)})`);
     scheduleSync({ changed: true });
   } else {
@@ -1515,7 +1540,7 @@ function renderRoutineExerciseInputs() {
         <button class="reorder-btn" data-role="move-up" title="Move up" ${i === 0 ? 'disabled' : ''}>▲</button>
         <button class="reorder-btn" data-role="move-down" title="Move down" ${i === last ? 'disabled' : ''}>▼</button>
       </div>
-      <input type="text" placeholder="Exercise name" list="exerciseNames" value="${escapeHtml(ex.name)}" data-role="rex-name">
+      <input type="text" placeholder="Exercise name" value="${escapeHtml(ex.name)}" data-role="rex-name">
       <input type="number" class="rex-sets" min="1" step="1" placeholder="Sets" value="${ex.sets}" data-role="rex-sets">
       <button class="remove-set" data-role="remove-rex" title="Remove">–</button>
     `;
@@ -1659,7 +1684,6 @@ function renderExerciseLibrary() {
       entry.name = trimmed;
       saveExerciseLibrary(exerciseLibrary);
       renderExerciseLibrary();
-      refreshExerciseDatalist();
       showToast('Renamed ✓ — updated everywhere it\'s linked');
     });
     row.querySelector('[data-role="delete-ex"]').addEventListener('click', () => {
@@ -1667,7 +1691,6 @@ function renderExerciseLibrary() {
         exerciseLibrary = exerciseLibrary.filter(e => e.id !== entry.id);
         saveExerciseLibrary(exerciseLibrary);
         renderExerciseLibrary();
-        refreshExerciseDatalist();
       }
     });
     exerciseLibraryListEl.appendChild(row);
@@ -1682,11 +1705,10 @@ document.getElementById('addLibraryExerciseBtn').addEventListener('click', () =>
     newExerciseInput.value = '';
     return;
   }
-  exerciseLibrary.push({ id: uid(), name });
+  exerciseLibrary.push(newLibraryEntry(name));
   saveExerciseLibrary(exerciseLibrary);
   newExerciseInput.value = '';
   renderExerciseLibrary();
-  refreshExerciseDatalist();
   showToast(`Added "${name}"`);
 });
 
@@ -1767,10 +1789,13 @@ function renderHistory() {
       </div>
     `;
 
+    // Expanding is a class flip on this one card. It used to rebuild every card
+    // in the list — volume maths and all — on each tap.
     card.querySelector('[data-role="head"]').addEventListener('click', () => {
-      if (openSessionIds.has(session.id)) openSessionIds.delete(session.id);
-      else openSessionIds.add(session.id);
-      renderHistory();
+      const open = !openSessionIds.has(session.id);
+      if (open) openSessionIds.add(session.id);
+      else openSessionIds.delete(session.id);
+      card.querySelector('[data-role="body"]').classList.toggle('open', open);
     });
 
     card.querySelector('[data-role="edit"]').addEventListener('click', (e) => {
@@ -1796,7 +1821,6 @@ function renderHistory() {
           deletedSessionIds.push(session.id);
           saveDeletedSessionIds(deletedSessionIds);
         }
-        refreshExerciseDatalist();
         renderHistory();
         scheduleSync({ changed: true });
       }
@@ -1937,7 +1961,6 @@ function renderSessionEditorCard(session) {
         saveSessions(sessions);
       }
       closeSessionEditor();
-      refreshExerciseDatalist();
       renderHistory();
       showToast('Workout updated ✓');
       scheduleSync({ changed: true });
@@ -2088,8 +2111,21 @@ function applyImportedBackup(data) {
     throw new Error('Not a valid workout tracker backup file');
   }
 
-  const existingSessionIds = new Set(sessions.map(s => s.id));
-  const newSessions = data.sessions.filter(s => s && s.id && !existingSessionIds.has(s.id));
+  /* Each record is checked before it's let in. One malformed workout used to be
+     merged as-is and then crash History, Charts or the sync wherever it was
+     first drawn — long after the restore had reported success. Bad records
+     are skipped and counted instead; a duplicate id inside the file counts
+     once. */
+  let skipped = 0;
+  const keep = (ok) => { if (!ok) skipped++; return ok; };
+
+  const seenSessionIds = new Set(sessions.map(s => s.id));
+  const newSessions = data.sessions.filter(s => {
+    if (!keep(isValidBackupSession(s))) return false;
+    if (seenSessionIds.has(s.id)) return false;
+    seenSessionIds.add(s.id);
+    return true;
+  });
   sessions = sessions.concat(newSessions);
   // A restored workout is no longer deleted — don't let a queued deletion
   // remove its rows from the sheet.
@@ -2099,20 +2135,28 @@ function applyImportedBackup(data) {
     saveDeletedSessionIds(deletedSessionIds);
   }
 
-  const existingRoutineIds = new Set(routines.map(r => r.id));
-  const newRoutines = data.routines.map(normalizeRoutine).filter(r => r && r.id && !existingRoutineIds.has(r.id));
+  const seenRoutineIds = new Set(routines.map(r => r.id));
+  const newRoutines = data.routines
+    .filter(r => keep(!!r && typeof r === 'object' && isNonEmptyString(r.id) && isNonEmptyString(r.name)
+      && Array.isArray(r.exercises || [])))
+    .map(normalizeRoutine)
+    .filter(r => keep(r.exercises.every(e => isNonEmptyString(e.name))))
+    .filter(r => !seenRoutineIds.has(r.id) && seenRoutineIds.add(r.id));
   routines = routines.concat(newRoutines);
 
-  const existingLibIds = new Set(exerciseLibrary.map(e => e.id));
-  const newLibEntries = normalizeExerciseLibrary(data.exerciseLibrary).filter(e => e && e.id && !existingLibIds.has(e.id));
+  const seenLibIds = new Set(exerciseLibrary.map(e => e.id));
+  const newLibEntries = normalizeExerciseLibrary(data.exerciseLibrary
+      .filter(e => keep(isNonEmptyString(e) || (!!e && typeof e === 'object' && isNonEmptyString(e.id) && isNonEmptyString(e.name)))))
+    .filter(e => !seenLibIds.has(e.id) && seenLibIds.add(e.id));
   exerciseLibrary = exerciseLibrary.concat(newLibEntries);
 
   // Body weights arrived in v2 backups; older files simply won't have the key.
   // Matched on date rather than id, since there is only ever one weigh-in per day.
-  const existingWeightDates = new Set(bodyWeights.map(w => w.date));
+  const seenWeightDates = new Set(bodyWeights.map(w => w.date));
   const newWeights = (Array.isArray(data.bodyWeights) ? data.bodyWeights : [])
-    .filter(w => w && w.date && !existingWeightDates.has(w.date))
-    .map(w => ({ id: w.id || uid(), date: w.date, weight: Number(w.weight) || 0, loggedAt: w.loggedAt || null }));
+    .filter(w => keep(!!w && isDateKey(w.date) && Number(w.weight) > 0))
+    .filter(w => !seenWeightDates.has(w.date) && seenWeightDates.add(w.date))
+    .map(w => ({ id: w.id || uid(), date: w.date, weight: Number(w.weight), loggedAt: w.loggedAt || null }));
   bodyWeights = bodyWeights.concat(newWeights);
 
   saveSessions(sessions);
@@ -2125,7 +2169,24 @@ function applyImportedBackup(data) {
     routines: newRoutines.length,
     exercises: newLibEntries.length,
     weights: newWeights.length,
+    skipped,
   };
+}
+
+const isNonEmptyString = (v) => typeof v === 'string' && v.trim() !== '';
+const isDateKey = (v) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v);
+
+// The minimum every screen relies on: an id, a real date, and exercises that
+// each have a name and a list of sets.
+function isValidBackupSession(s) {
+  return !!s && typeof s === 'object'
+    && isNonEmptyString(s.id)
+    && isDateKey(s.date)
+    && Array.isArray(s.exercises)
+    && s.exercises.every(ex => !!ex && typeof ex === 'object'
+      && isNonEmptyString(ex.name)
+      && Array.isArray(ex.sets)
+      && ex.sets.every(set => !!set && typeof set === 'object'));
 }
 
 const importFileInput = document.getElementById('importFileInput');
@@ -2138,12 +2199,12 @@ importFileInput.addEventListener('change', (e) => {
     try {
       const data = JSON.parse(reader.result);
       const added = applyImportedBackup(data);
-      refreshExerciseDatalist();
       populateRoutineSelect();
       renderHistory();
       renderBodyWeightCard();
       scheduleSync({ changed: true });
-      showToast(`Restored ${added.sessions} workout${added.sessions !== 1 ? 's' : ''}, ${added.routines} routine${added.routines !== 1 ? 's' : ''}, ${added.exercises} exercise${added.exercises !== 1 ? 's' : ''}, ${added.weights} weigh-in${added.weights !== 1 ? 's' : ''}`);
+      const msg = `Restored ${added.sessions} workout${added.sessions !== 1 ? 's' : ''}, ${added.routines} routine${added.routines !== 1 ? 's' : ''}, ${added.exercises} exercise${added.exercises !== 1 ? 's' : ''}, ${added.weights} weigh-in${added.weights !== 1 ? 's' : ''}`;
+      showToast(added.skipped ? `${msg} — ${added.skipped} damaged record${added.skipped !== 1 ? 's' : ''} skipped` : msg);
     } catch (err) {
       console.error(err);
       showToast("Couldn't read that file — is it a workout tracker backup?");
@@ -2180,7 +2241,7 @@ const syncTokenInput = document.getElementById('syncTokenInput');
 const syncStatusEl = document.getElementById('syncStatus');
 
 function syncWindowStart() {
-  return new Date(Date.now() - SYNC_WINDOW_DAYS * 86400000).toISOString().slice(0, 10);
+  return addDaysKey(todayStr(), -SYNC_WINDOW_DAYS);
 }
 
 // One row per logged set, keyed by session id + position so the same set always
@@ -2299,7 +2360,7 @@ function shortWhen(date) {
   if (mins < 60) return `${mins}m ago`;
   const hrs = Math.floor(mins / 60);
   if (hrs < 24) return `${hrs}h ago`;
-  return fmtDateShort(date.toISOString().slice(0, 10));
+  return fmtDateShort(localDateKey(date));
 }
 
 async function syncNow({ silent = false } = {}) {
@@ -2607,8 +2668,7 @@ function renderWeightChart() {
 
   // Trailing 7-day mean at each point, over whatever entries exist in that window.
   const rolling = all.map((w, i) => {
-    const windowStart = new Date(new Date(w.date + 'T00:00:00').getTime() - 6 * 86400000)
-      .toISOString().slice(0, 10);
+    const windowStart = addDaysKey(w.date, -6);
     const win = all.slice(0, i + 1).filter(x => x.date >= windowStart);
     return win.reduce((s, x) => s + x.weight, 0) / win.length;
   });
@@ -2647,7 +2707,8 @@ function renderWeightChart() {
       maintainAspectRatio: false,
       plugins: { legend: { display: false } },
       scales: {
-        x: { ticks: { color: '#9aa2b1', maxRotation: 0, autoSkip: true, font: { size: 10 } }, grid: { color: '#2a2f3a' } },
+        // Axis gets "Sep 1"; the tooltip keeps the full date from `labels`.
+        x: { ticks: { color: '#9aa2b1', maxRotation: 0, autoSkip: true, font: { size: 10 }, callback: (v) => fmtDateShort(all[v].date) }, grid: { color: '#2a2f3a' } },
         y: { ticks: { color: '#9aa2b1', font: { size: 10 } }, grid: { color: '#2a2f3a' }, min: range.min, max: range.max },
       },
     },
@@ -2786,7 +2847,7 @@ function drawChartsFor(exerciseName) {
         maintainAspectRatio: false,
         plugins: { legend: { display: false } },
         scales: {
-          x: { ticks: { color: '#9aa2b1', maxRotation: 0, autoSkip: true, font: { size: 10 } }, grid: { color: '#2a2f3a' } },
+          x: { ticks: { color: '#9aa2b1', maxRotation: 0, autoSkip: true, font: { size: 10 }, callback: (v) => fmtDateShort(points[v][0]) }, grid: { color: '#2a2f3a' } },
           y: { ticks: { color: '#9aa2b1', font: { size: 10 } }, grid: { color: '#2a2f3a' }, min: axisRange.min, max: axisRange.max },
         },
       },
@@ -2809,7 +2870,6 @@ if (resumed && resumed.activeWorkout && resumed.activeWorkout.startTime) {
   draftExercises.push(newDraftExercise());
 }
 renderExerciseList();
-refreshExerciseDatalist();
 populateRoutineSelect();
 renderBodyWeightCard();
 syncUrlInput.value = syncConfig.url;
@@ -2826,6 +2886,16 @@ window.addEventListener('pageshow', () => {
   renderBodyWeightCard();
   scheduleSync();
 });
+
+/* Ask the browser to treat this app's storage as persistent, so it isn't
+   cleared to free space. Everything lives in localStorage, and the sheet only
+   holds 180 days of sets — no routines, no library. Asking costs nothing;
+   if the browser declines, nothing changes. */
+if (navigator.storage && typeof navigator.storage.persist === 'function') {
+  navigator.storage.persisted()
+    .then(already => already || navigator.storage.persist())
+    .catch(() => {});
+}
 
 // First sync of the session. Deliberately silent — a failed background sync
 // shouldn't greet you with an error toast every time you open the app.
