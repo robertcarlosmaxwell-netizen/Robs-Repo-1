@@ -578,6 +578,14 @@ let bodyWeights = loadBodyWeights();
 let syncConfig = loadSyncConfig();
 let deletedSessionIds = loadDeletedSessionIds();
 let editingSessionId = null;
+let editingDraft = null;    // the History editor's working copy (see renderSessionEditorCard)
+let editingDirty = false;   // true once anything in that copy has been changed
+
+function closeSessionEditor() {
+  editingSessionId = null;
+  editingDraft = null;
+  editingDirty = false;
+}
 let currentView = 'log';
 let openSessionIds = new Set();
 let draftRoutine = null; // { id: string|null, name: string, exercises: [{name, sets}] }
@@ -1086,6 +1094,18 @@ function renderExerciseList() {
       updateBlockPrevData(block, ex);
     });
     head.querySelector('[data-role="remove-ex"]').addEventListener('click', () => {
+      // It sits right beside the name field, so a stray tap is easy. Ask only
+      // when there's something to lose; an empty block still goes in one tap.
+      const typed = ex.sets.filter(s => isCardio
+        ? !blank(s.mm) || !blank(s.ss) || !blank(s.distanceMi) || !blank(s.inclinePct)
+        : !blank(s.weight) || !blank(s.reps)).length;
+      if (typed || !blank(ex.notes)) {
+        const label = blank(ex.name) ? 'this exercise' : `"${ex.name.trim()}"`;
+        const what = typed
+          ? `${typed} ${isCardio ? 'interval' : 'set'}${typed !== 1 ? 's' : ''} you've entered`
+          : 'its note';
+        if (!confirm(`Remove ${label} and ${what}?`)) return;
+      }
       draftExercises = draftExercises.filter(d => d.id !== ex.id);
       renderExerciseList();
     });
@@ -1755,6 +1775,13 @@ function renderHistory() {
 
     card.querySelector('[data-role="edit"]').addEventListener('click', (e) => {
       e.stopPropagation();
+      // Only one workout is edited at a time, so starting another replaces it.
+      if (editingSessionId && editingDirty) {
+        const other = sessions.find(s => s.id === editingSessionId);
+        const when = other ? fmtDate(other.date) : 'the other workout';
+        if (!confirm(`Discard your unsaved changes to ${when}?`)) return;
+      }
+      closeSessionEditor();
       editingSessionId = session.id;
       openSessionIds.add(session.id);
       renderHistory();
@@ -1784,13 +1811,27 @@ function renderHistory() {
    keeps the sync keys stable, so corrected rows update in the spreadsheet
    instead of appearing twice. */
 function renderSessionEditorCard(session) {
-  const draft = {
-    ...session,
-    exercises: session.exercises.map(ex => ({ ...ex, sets: ex.sets.map(s => ({ ...s })) })),
-  };
+  /* The draft lives outside this function. renderHistory() rebuilds every card
+     — tapping any other card to expand it does — and the draft used to be
+     re-copied from the saved session each time, silently throwing the edits
+     away. Now it's copied once, when Edit is tapped, and kept until Save or
+     Cancel. */
+  if (!editingDraft || editingDraft.id !== session.id) {
+    editingDraft = {
+      ...session,
+      exercises: session.exercises.map(ex => ({ ...ex, sets: ex.sets.map(s => ({ ...s })) })),
+    };
+    editingDirty = false;
+  }
+  const draft = editingDraft;
 
   const card = document.createElement('div');
   card.className = 'session-card';
+  // Any typing or removal marks the draft as changed, so leaving it can ask first.
+  card.addEventListener('input', () => { editingDirty = true; });
+  card.addEventListener('click', (e) => {
+    if (e.target.closest('[data-role="rm-ex"], [data-role="e-rm"]')) editingDirty = true;
+  }, true);
 
   const head = document.createElement('div');
   head.className = 'session-head';
@@ -1882,7 +1923,7 @@ function renderSessionEditorCard(session) {
       <button class="btn btn-primary btn-sm" data-role="save">Save Changes</button>
     `;
     actions.querySelector('[data-role="cancel"]').addEventListener('click', () => {
-      editingSessionId = null;
+      closeSessionEditor();
       renderHistory();
     });
     function commitEdit(cleaned) {
@@ -1895,7 +1936,7 @@ function renderSessionEditorCard(session) {
         sessions[idx] = { ...sessions[idx], exercises: cleaned, editedAt: new Date().toISOString() };
         saveSessions(sessions);
       }
-      editingSessionId = null;
+      closeSessionEditor();
       refreshExerciseDatalist();
       renderHistory();
       showToast('Workout updated ✓');
@@ -2756,9 +2797,14 @@ function drawChartsFor(exerciseName) {
 
 /* ---------- Init ---------- */
 const resumed = loadActiveWorkout();
-if (resumed && resumed.activeWorkout && Array.isArray(resumed.draftExercises) && resumed.draftExercises.length) {
+// The workout is what matters, not whether it has exercises yet. This used to
+// require at least one, so removing them all and then reloading (or iOS
+// killing the app) silently threw away the running workout and its timer.
+if (resumed && resumed.activeWorkout && resumed.activeWorkout.startTime) {
   activeWorkout = resumed.activeWorkout;
-  draftExercises = resumed.draftExercises;
+  draftExercises = Array.isArray(resumed.draftExercises) && resumed.draftExercises.length
+    ? resumed.draftExercises
+    : [newDraftExercise()];
 } else {
   draftExercises.push(newDraftExercise());
 }
