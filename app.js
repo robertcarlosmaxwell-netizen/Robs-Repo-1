@@ -624,18 +624,24 @@ let draftRoutine = null; // { id: string|null, name: string, exercises: [{name, 
 let activeWorkout = null; // { startTime: epochMs, date, routineId, routineName } while a workout is in progress
 let timerInterval = null;
 
-/* Keep the fixed End Workout button positioned correctly above the bottom tab bar. */
+/* Publishes the tab bar's measured height as --tabbar-h.
+ *
+ * As of v27 the app shell is a fixed-height flex column (#app) and the tab bar
+ * is an ordinary flex child, so NOTHING in the normal layout needs this any
+ * more — the only consumer is .update-banner, which is position:fixed and has
+ * to know where the tab bar's top edge is.
+ *
+ * It measures with offsetHeight, which ALREADY INCLUDES the tab bar's
+ * padding-bottom:var(--safe-bottom). Anything consuming --tabbar-h must not add
+ * var(--safe-bottom) again; doing exactly that is what put a ~34px gap under the
+ * End Workout button in v26.
+ *
+ * The old --endbtn-h clearance variable is gone with v27: the button is a
+ * sibling of the scroller rather than floating over it, so there is nothing to
+ * reserve room for. */
 function syncLayoutVars() {
   const tabbarEl = document.querySelector('nav.tabbar');
   if (tabbarEl) document.documentElement.style.setProperty('--tabbar-h', tabbarEl.offsetHeight + 'px');
-  // The End Workout button is position:fixed above the tab bar, so the workout
-  // screen needs that much clearance or the last set row sits underneath it.
-  // offsetHeight is 0 while the button is hidden, which is exactly right.
-  const endBtn = document.getElementById('endWorkoutBtn');
-  if (endBtn) {
-    const h = endBtn.offsetHeight;
-    document.documentElement.style.setProperty('--endbtn-h', (h ? h + 24 : 0) + 'px');
-  }
 }
 window.addEventListener('resize', syncLayoutVars);
 window.addEventListener('load', syncLayoutVars);

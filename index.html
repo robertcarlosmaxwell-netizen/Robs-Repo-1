@@ -43,18 +43,26 @@
     font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
     overscroll-behavior-y:none;
   }
+  /* Fixed-height flex column. NOTHING here is position:fixed against the viewport
+     any more — the header, the End Workout button and the tab bar are all ordinary
+     flex children, and `main` is the only scrolling element in the app.
+
+     That is deliberate and is the permanent fix for the End Workout button drifting
+     mid-screen while scrolling. iOS repositions position:fixed elements against the
+     layout viewport, and the keyboard, rubber-band scrolling and the shrinking URL
+     bar all move that out from under you. A flex child cannot drift, because it has
+     no viewport relationship to lose. */
   #app{
     display:flex;
     flex-direction:column;
-    min-height:100vh;
-    min-height:100dvh;
+    height:100vh;
+    height:100dvh;
+    overflow:hidden;
   }
   header{
+    flex:0 0 auto;
     padding: calc(14px + var(--safe-top)) 18px 12px;
     background:var(--bg);
-    position:sticky;
-    top:0;
-    z-index:5;
     border-bottom:1px solid var(--border);
   }
   header h1{
@@ -68,20 +76,30 @@
     font-size:13px;
     color:var(--text-dim);
   }
+  /* min-height:0 is load-bearing: without it a flex child refuses to shrink below
+     its content, so nothing scrolls and the page grows instead. */
   main{
-    flex:1;
-    padding: 16px 16px calc(90px + var(--safe-bottom));
+    flex:1 1 auto;
+    min-height:0;
+    overflow-y:auto;
+    -webkit-overflow-scrolling:touch;
+    overscroll-behavior:contain;
+    /* No padding-top. A position:sticky child measures top:0 against this
+       element's CONTENT box, so any padding here would park the workout screen's
+       sticky header 16px down and let set rows scroll through the strip above it.
+       The top padding lives on .view instead, where the sticky header's existing
+       negative margin already cancels it. */
+    padding:0 16px 16px;
     max-width:640px;
     width:100%;
     margin:0 auto;
   }
-  .view{display:none;}
+  .view{display:none; padding-top:16px;}
   .view.active{display:block;}
 
   /* Bottom nav */
   nav.tabbar{
-    position:fixed;
-    left:0;right:0;bottom:0;
+    flex:0 0 auto;
     display:flex;
     background:rgba(23,26,33,0.92);
     backdrop-filter: blur(14px);
@@ -510,7 +528,7 @@
     position:fixed;
     left:12px;
     right:12px;
-    bottom:calc(var(--tabbar-h) + var(--safe-bottom) + 74px);
+    bottom:calc(var(--tabbar-h) + 74px);  /* --tabbar-h already includes the safe area */
     z-index:60;
     background:var(--accent);
     color:#0b1020;
@@ -744,10 +762,10 @@
     padding:3px 12px;
   }
 
-  /* The End Workout button is fixed above the tab bar, so the last set row would
-     otherwise sit underneath it. --endbtn-h is measured at runtime by
-     syncLayoutVars() and is 0px whenever the button is hidden. */
-  #workoutScreen{padding-bottom:calc(8px + var(--endbtn-h, 0px));}
+  /* No clearance needed: the End Workout button is a sibling of the scroller, not
+     an overlay on top of it, so it can never cover a set row. (--endbtn-h, which
+     reserved that space in v21, is gone.) */
+  #workoutScreen{padding-bottom:8px;}
 
   /* Says how a session total was reached when an assisted exercise needed a
      body weight that wasn't logged that day. Only appears when it applies. */
@@ -811,18 +829,20 @@
   .guard-actions{display:flex; flex-direction:column; gap:8px;}
   .guard-actions .btn{width:100%;}
 
-  /* Fixed End Workout button */
+  /* End Workout button — shown only while a workout is active.
+     A flex child of #app, sitting between the scroller and the tab bar. It used to
+     be position:fixed with bottom:calc(--tabbar-h + 12px + --safe-bottom), which
+     double-counted the safe area: --tabbar-h is measured with offsetHeight and the
+     tab bar already carries padding-bottom:var(--safe-bottom). That is what left a
+     ~34px gap under the button with set rows showing through it. */
   #endWorkoutBtn{
     display:none;
+    flex:0 0 auto;
     align-items:center;
     justify-content:center;
-    position:fixed;
-    left:16px;
-    right:16px;
-    bottom:calc(var(--tabbar-h, 70px) + 12px + var(--safe-bottom));
+    width:calc(100% - 32px);
     max-width:608px;
-    margin:0 auto;
-    z-index:9;
+    margin:8px auto 12px;
     background:var(--danger);
     color:#fff;
     border:none;
@@ -892,7 +912,6 @@
       </div>
     </section>
 
-    <button id="endWorkoutBtn">End Workout</button>
 
     <!-- ROUTINES VIEW -->
     <section id="view-routines" class="view">
@@ -972,6 +991,8 @@
       <div id="chartArea"></div>
     </section>
   </main>
+
+  <button id="endWorkoutBtn">End Workout</button>
 
   <nav class="tabbar">
     <button class="tab-btn active" data-view="log">
