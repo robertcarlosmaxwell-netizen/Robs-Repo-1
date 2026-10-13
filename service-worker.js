@@ -1,7 +1,17 @@
 // Bump this version string any time index.html/app.js/manifest.json/icons change.
 // The browser re-installs the service worker whenever this file's bytes change, which
 // is what actually pushes updated app files out to people who already installed the app.
-const CACHE_NAME = 'workout-tracker-v25';
+//
+// CACHE_PREFIX exists because Cache Storage is scoped to the ORIGIN, not to the app.
+// Every PWA Rob installs from github.io shares one origin, so this service worker can
+// see — and delete — the Nutrition App's caches too. Activate must therefore clean up
+// only its own old versions. See the activate handler.
+//
+// CACHE_NAME must always start with CACHE_PREFIX. It's spelled out in full rather than
+// concatenated so that grepping for `workout-tracker-v25`, or eyeballing this line on
+// the live Pages URL, still works — test-service-worker.js pins that they agree.
+const CACHE_PREFIX = 'workout-tracker-';
+const CACHE_NAME = 'workout-tracker-v26';
 const ASSETS = [
   './',
   './index.html',
@@ -39,7 +49,16 @@ self.addEventListener('install', (event) => {
 self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches.keys().then((keys) =>
-      Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k)))
+      Promise.all(
+        keys
+          // Only this app's own old versions. The obvious `k !== CACHE_NAME` deletes
+          // EVERY cache on the origin, which means every Workout App update would wipe
+          // the Nutrition App's offline copy — and vice versa once both are installed.
+          // Nothing is lost permanently (the other app refills its cache the next time
+          // it's opened online) but until then it won't open offline at all.
+          .filter((k) => k.startsWith(CACHE_PREFIX) && k !== CACHE_NAME)
+          .map((k) => caches.delete(k))
+      )
     )
   );
   self.clients.claim();
