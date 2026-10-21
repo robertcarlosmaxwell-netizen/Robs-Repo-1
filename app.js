@@ -382,6 +382,34 @@ function sessionVolume(session) {
   return sessionVolumeDetail(session).total;
 }
 
+/* Total reps and total volume for ONE exercise's sets, in the same units the
+   charts and the history cards use.
+
+   Rob's progression is a fixed rep target per exercise (12 on the barbell and
+   machine work, ~24 on the light isolation work). When a set fails at the
+   heavier weight he finishes the remaining reps lighter, which the app logs as
+   an extra set. With the rep total held constant, volume is exactly "how much
+   of the target was done at the heavier weight" — every rep moved up from the
+   light weight to the heavy one is worth the gap between them. That is what
+   makes a week-to-week volume comparison worth showing at all.
+
+   It is also why reps are returned alongside: the comparison only means what it
+   looks like when the rep totals match. Lat pull down 2026-10-19 (62.5x12,
+   70x12, 77.5x12 — the best session of the cut) scores 2,520 against 2,537.5 on
+   10-05, purely because 10-05 ran 37 reps to its 36. Show both numbers and that
+   reads as "different work", not "you got worse".
+
+   `volume` is null for an assisted exercise with no body weight to convert
+   with — same rule as sessionVolumeDetail, which leaves it out rather than
+   contributing an upside-down number. */
+function exerciseTotals(sets, inverted, date) {
+  const list = sets || [];
+  const reps = list.reduce((sum, s) => sum + (Number(s.reps) || 0), 0);
+  if (!inverted) return { reps, volume: setsToVolume(list) };
+  const bw = bodyWeightBasisFor(date);
+  return { reps, volume: bw ? invertedTrueLoad(list, bw.weight) : null };
+}
+
 // Total treadmill/bike time in a session, for the history card subtitle.
 function sessionCardioMinutes(session) {
   return session.exercises.reduce(
@@ -914,8 +942,14 @@ function buildStrengthRows(block, ex, perf) {
       <input type="number" inputmode="numeric" placeholder="Reps" min="0" step="1" value="${set.reps}" data-role="reps">
       <button class="remove-set" data-role="remove-set" title="Remove set">–</button>
     `;
-    row.querySelector('[data-role="weight"]').addEventListener('input', (e) => set.weight = e.target.value);
-    row.querySelector('[data-role="reps"]').addEventListener('input', (e) => set.reps = e.target.value);
+    row.querySelector('[data-role="weight"]').addEventListener('input', (e) => {
+      set.weight = e.target.value;
+      updateBlockVsPrev(block, ex);
+    });
+    row.querySelector('[data-role="reps"]').addEventListener('input', (e) => {
+      set.reps = e.target.value;
+      updateBlockVsPrev(block, ex);
+    });
     row.querySelector('[data-role="remove-set"]').addEventListener('click', () => {
       ex.sets = ex.sets.filter((_, i) => i !== si);
       if (ex.sets.length === 0) ex.sets.push({ weight: '', reps: '' });
@@ -924,6 +958,16 @@ function buildStrengthRows(block, ex, perf) {
     setsWrap.appendChild(row);
   });
   block.appendChild(setsWrap);
+
+  // Running total against the last time this exercise was done. Sits directly
+  // under the numbers it's summing, so it's in view while you're typing into
+  // the last set rather than up at the top of the card.
+  const vsPrev = document.createElement('div');
+  vsPrev.className = 'vs-prev';
+  vsPrev.dataset.role = 'vs-prev';
+  block.appendChild(vsPrev);
+  setBlockPrevPerf(block, perf);
+  updateBlockVsPrev(block, ex);
 
   const addSetBtn = document.createElement('button');
   addSetBtn.className = 'add-set-btn';
@@ -1040,6 +1084,83 @@ function updateBlockPrevNote(block, perf) {
   if (textEl) textEl.textContent = note;
 }
 
+/* The live "vs last time" line under the set rows.
+ *
+ * Recomputed on every keystroke in a weight or reps box, so the number you're
+ * chasing is on screen at the moment you're deciding what to do with the next
+ * set — not something to work out in your head between sets.
+ *
+ * Reads from the same past session as the PREV column and the note banner.
+ *
+ * Deliberately NOT a verdict. It goes green only when BOTH reps and volume have
+ * caught up, because volume on its own is misleading when the rep count moved
+ * (see exerciseTotals). Short on either and it stays dim, which means "look at
+ * the two numbers", not "you failed".
+ */
+/* Which past session each exercise block is currently painted against.
+ *
+ * It lives here rather than being passed into the row handlers because the two
+ * are bound at DIFFERENT times. The weight/reps listeners are attached once,
+ * when the block is built — at which point a freshly added exercise has no name
+ * and therefore no past session at all. Typing the name afterwards deliberately
+ * does NOT rebuild the block (that would move the caret mid-word), so a handler
+ * that closed over `perf` would keep holding the null it was born with and the
+ * line would never appear. Look it up at paint time instead.
+ *
+ * A WeakMap rather than a property on the element: the block is thrown away on
+ * every re-render and this should go with it. */
+const blockPrevPerf = new WeakMap();
+
+function setBlockPrevPerf(block, perf) {
+  blockPrevPerf.set(block, perf || null);
+}
+
+function updateBlockVsPrev(block, ex) {
+  const el = block.querySelector('[data-role="vs-prev"]');
+  if (!el) return;
+  const perf = blockPrevPerf.get(block);
+  if (!perf) { el.hidden = true; return; }           // nothing to compare against
+  el.hidden = false;
+
+  const inverted = isInvertedExercise(ex);
+  // Each side converts with the body weight of ITS OWN date, exactly as the
+  // charts and history totals do. During a cut that means a lighter Rob moving
+  // the same assist scores lower — which is the honest reading, not a bug.
+  const now = exerciseTotals(ex.sets, inverted, activeWorkoutDate());
+  const was = exerciseTotals(perf.sets, inverted, perf.date);
+
+  const parts = [`<span class="vs-label">vs ${escapeHtml(fmtDateShort(perf.date))}</span>`];
+  parts.push(`${now.reps}/${was.reps} reps`);
+
+  let met = now.reps >= was.reps;
+  if (was.volume === null || now.volume === null) {
+    // Assisted exercise, no weigh-in to convert with. Reps still compare fine.
+    parts.push('no body weight logged');
+    met = false;
+  } else if (was.volume === 0) {
+    // Bodyweight work (leg raises): weight is 0, so volume is 0 on both sides
+    // and says nothing. Reps are the whole story — don't print a useless "0/0".
+  } else {
+    parts.push(`${fmtVolume(now.volume)}/${fmtVolume(was.volume)} lb`);
+    met = met && now.volume >= was.volume;
+  }
+
+  el.innerHTML = parts.join(' <span class="vs-sep">·</span> ');
+  el.classList.toggle('met', met);
+}
+
+// The date the running workout is logged under — what today's assisted lifts
+// convert with. Falls back to today for a block rendered before Start Workout.
+function activeWorkoutDate() {
+  return (activeWorkout && activeWorkout.date) || todayStr();
+}
+
+// Thousands separators, at most one decimal. Volumes land on .5 often enough
+// (62.5 x 13) that rounding to whole pounds would visibly not add up.
+function fmtVolume(n) {
+  return (Math.round(n * 10) / 10).toLocaleString('en-US', { maximumFractionDigits: 1 });
+}
+
 // Refresh the "PREV" header + per-set previous values for one exercise block
 // without rebuilding the DOM (keeps focus/cursor position while typing the name).
 function paintCardioPrev(block, perf) {
@@ -1061,6 +1182,8 @@ function updateBlockPrevData(block, ex) {
   });
   paintCardioPrev(block, perf);
   updateBlockPrevNote(block, perf);
+  setBlockPrevPerf(block, perf);
+  updateBlockVsPrev(block, ex);
 }
 
 function renderExerciseList() {

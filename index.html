@@ -658,6 +658,30 @@
   }
   .prev-note .prev-note-text{min-width:0; overflow-wrap:anywhere;}
 
+  /* Live "vs last time" running total, directly under the set rows.
+     Dim by default and green only when reps AND volume have both caught up —
+     it's a guardrail you glance at, not a verdict. */
+  .vs-prev{
+    margin:8px 0 0;
+    text-align:center;
+    font-size:12px;
+    font-weight:700;
+    color:var(--text-dim);
+    font-variant-numeric:tabular-nums;
+    line-height:1.4;
+    overflow-wrap:anywhere;
+  }
+  .vs-prev[hidden]{display:none;}
+  .vs-prev .vs-label{
+    font-size:10px;
+    letter-spacing:0.03em;
+    text-transform:uppercase;
+    color:var(--accent);
+  }
+  .vs-prev .vs-sep{opacity:0.45;}
+  .vs-prev.met{color:var(--good);}
+  .vs-prev.met .vs-label{color:var(--good);}
+
   .sets-header{
     display:flex;
     align-items:center;
