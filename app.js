@@ -904,6 +904,139 @@ function fieldsToSeconds(bout) {
   return Math.max(0, Math.round(mm * 60 + ss));
 }
 
+/* ---------- Drop sets ----------
+   A set that fails at the heavier weight and is finished lighter is ONE set to
+   Rob, logged as several rows. `drop: true` on a row means "this continues the
+   set above it". It is a flag on a flat array, not a nested structure, because
+   the sync key is `${sessionId}:${exIdx}:${setIdx}` from the ARRAY index and the
+   Apps Script prunes any key it no longer sees. Grouped numbering below is for
+   display only and must never reach that key. */
+
+// Row 0 can never be a continuation, whatever the data says.
+function isDropRow(sets, i) {
+  return i > 0 && !!(sets[i] && sets[i].drop);
+}
+
+// For each row: its set number (n, counting only non-drop rows) and its position
+// within that set (k, 0 for the row that starts it).
+function setPositions(sets) {
+  let n = 0, k = 0;
+  return (sets || []).map((s, i) => {
+    if (isDropRow(sets, i)) k++;
+    else { n++; k = 0; }
+    return { n, k, drop: k > 0 };
+  });
+}
+
+// What the SET column shows: ['1', '2', '3', '↳'] rather than 1..4.
+function setLabels(sets) {
+  return setPositions(sets).map(p => p.drop ? '↳' : String(p.n));
+}
+
+// [[seg, seg], [seg], ...] — each inner array is one set as Rob counts it.
+function groupSets(sets) {
+  const groups = [];
+  (sets || []).forEach((s, i) => {
+    if (isDropRow(sets, i)) groups[groups.length - 1].push(s);
+    else groups.push([s]);
+  });
+  return groups;
+}
+
+function fmtSegment(s) {
+  return `${s.weight}×${s.reps}`;
+}
+
+function withDrop(s, drop) {
+  const c = { ...s };
+  if (drop) c.drop = true;
+  else delete c.drop;
+  return c;
+}
+
+/* The one place rows leave a strength exercise. Keeps the rows `keep` accepts
+   and re-derives the flags so the result is always valid:
+   - row 0 is never a drop;
+   - removing a row that STARTS a set clears the flag on the row that followed
+     it, so a tail never silently joins the set above. [1, 2, 3, ↳] minus set 3
+     is [1, 2, 3], not [1, 2, ↳] — that would be a different set entirely.
+   Removing a drop row leaves the chain joined, which is what it was.
+   Doesn't mutate: rows whose flag is unchanged are passed through as-is, the
+   rest are copied. The save guard runs this on the live draft, and "Go Back &
+   Fix" has to find the flags exactly as they were. */
+function compactSets(sets, keep = () => true) {
+  const out = [];
+  let orphan = false;
+  (sets || []).forEach((s, i) => {
+    const drop = isDropRow(sets, i) && !orphan;
+    if (!keep(s, i)) {
+      if (!drop) orphan = true;
+      return;
+    }
+    orphan = false;
+    const want = drop && out.length > 0;
+    out.push(!!s.drop === want ? s : withDrop(s, want));
+  });
+  return out;
+}
+
+function removeSetAt(sets, index) {
+  return compactSets(sets, (_, i) => i !== index);
+}
+
+// Tap on the set number. In place, because the row's listeners hold the object.
+function toggleDrop(sets, i) {
+  if (i < 1 || !sets[i]) return;
+  if (sets[i].drop) delete sets[i].drop;
+  else sets[i].drop = true;
+}
+
+/* Which past segment sits in today's row: matched by set number, then by
+   position within the set — never by row index, which is what made last week's
+   failed 75×5 show up as "set 3". `more` is true when that past segment had
+   another after it, and depends only on the past session. */
+function prevSegmentFor(prevGroups, pos) {
+  const group = prevGroups[pos.n - 1];
+  const seg = group && group[pos.k];
+  if (!seg) return null;
+  return { seg, more: pos.k < group.length - 1, group };
+}
+
+/* "↳ part of set N?" — N for each row that should offer it, else 0.
+
+   Runs on every keystroke, so it only compares adjacent draft rows and last
+   session's grouped sets (already in hand): no sorting, no scan of `sessions`.
+   A row qualifies when:
+   - it isn't flagged, and has a weight below the row above (above it, for an
+     assisted exercise — more assistance is the easier direction), AND
+   - the set above came up short of what that set reached last time, counting
+     all its segments on both sides.
+   The second half is what stops a planned back-off (75×12 then 65×12) from
+   nagging every week: a full set isn't a failed one. No past session, no hint;
+   tapping the set number still works. */
+function dropHintRows(sets, prevGroups, inverted) {
+  const pos = setPositions(sets);
+  return (sets || []).map((s, i) => {
+    if (i < 1 || pos[i].drop) return 0;
+    const above = sets[i - 1];
+    if (blank(s.weight) || blank(above.weight) || blank(above.reps)) return 0;
+    const w = Number(s.weight), wa = Number(above.weight);
+    if (isNaN(w) || isNaN(wa)) return 0;
+    if (inverted ? !(w > wa) : !(w < wa)) return 0;
+
+    const n = pos[i - 1].n;
+    const past = prevGroups[n - 1];
+    if (!past) return 0;
+    const target = past.reduce((sum, seg) => sum + (Number(seg.reps) || 0), 0);
+    let done = 0;
+    for (let j = i - 1; j >= 0; j--) {
+      done += Number(sets[j].reps) || 0;
+      if (!pos[j].drop) break;
+    }
+    return done < target ? n : 0;
+  });
+}
+
 function newDraftExercise(name = '') {
   const cardio = isCardioExerciseName(name);
   return {
@@ -933,11 +1066,12 @@ function buildStrengthRows(block, ex, perf) {
   ex.sets.forEach((set, si) => {
     const row = document.createElement('div');
     row.className = 'set-row';
-    const prevSet = perf && perf.sets[si];
-    const prevText = prevSet ? `${prevSet.weight}×${prevSet.reps}` : '—';
+    row.dataset.role = 'set-row';
+    // Number, PREV and the drop styling are filled in by paintStrengthRows, which
+    // reads the past session at paint time — see blockPrevPerf.
     row.innerHTML = `
-      <span class="set-idx">${si + 1}</span>
-      <span class="prev-val" data-role="prev-val">${prevText}</span>
+      <span class="set-idx${si > 0 ? ' tappable' : ''}" data-role="set-idx"></span>
+      <span class="prev-val" data-role="prev-val">—</span>
       <input type="number" inputmode="decimal" placeholder="Weight" min="0" step="any" value="${set.weight}" data-role="weight">
       <input type="number" inputmode="numeric" placeholder="Reps" min="0" step="1" value="${set.reps}" data-role="reps">
       <button class="remove-set" data-role="remove-set" title="Remove set">–</button>
@@ -945,17 +1079,50 @@ function buildStrengthRows(block, ex, perf) {
     row.querySelector('[data-role="weight"]').addEventListener('input', (e) => {
       set.weight = e.target.value;
       updateBlockVsPrev(block, ex);
+      paintDropHints(block, ex);
     });
     row.querySelector('[data-role="reps"]').addEventListener('input', (e) => {
       set.reps = e.target.value;
       updateBlockVsPrev(block, ex);
+      paintDropHints(block, ex);
+    });
+    if (si > 0) {
+      row.querySelector('[data-role="set-idx"]').addEventListener('click', () => {
+        toggleDrop(ex.sets, si);
+        paintStrengthRows(block, ex);
+      });
+    }
+    // Only a cell carrying a "+" does anything; the rest of the time it's text.
+    row.querySelector('[data-role="prev-val"]').addEventListener('click', (e) => {
+      if (!e.currentTarget.classList.contains('has-more')) return;
+      row.dataset.expanded = row.dataset.expanded === '1' ? '' : '1';
+      paintStrengthRows(block, ex);
     });
     row.querySelector('[data-role="remove-set"]').addEventListener('click', () => {
-      ex.sets = ex.sets.filter((_, i) => i !== si);
+      ex.sets = removeSetAt(ex.sets, si);
       if (ex.sets.length === 0) ex.sets.push({ weight: '', reps: '' });
       renderExerciseList();
     });
     setsWrap.appendChild(row);
+
+    // Last time's whole chain for this set, opened from the "+".
+    const chain = document.createElement('div');
+    chain.className = 'prev-chain';
+    chain.dataset.role = 'prev-chain';
+    chain.hidden = true;
+    setsWrap.appendChild(chain);
+
+    const hint = document.createElement('button');
+    hint.type = 'button';
+    hint.className = 'drop-hint';
+    hint.dataset.role = 'drop-hint';
+    hint.hidden = true;
+    hint.addEventListener('click', () => {
+      if (si < 1) return;
+      set.drop = true;
+      paintStrengthRows(block, ex);
+    });
+    setsWrap.appendChild(hint);
   });
   block.appendChild(setsWrap);
 
@@ -968,6 +1135,7 @@ function buildStrengthRows(block, ex, perf) {
   block.appendChild(vsPrev);
   setBlockPrevPerf(block, perf);
   updateBlockVsPrev(block, ex);
+  paintStrengthRows(block, ex);
 
   const addSetBtn = document.createElement('button');
   addSetBtn.className = 'add-set-btn';
@@ -1176,14 +1344,61 @@ function updateBlockPrevData(block, ex) {
   const perf = lastPerformanceFor(ex.name);
   const headerPrevEl = block.querySelector('[data-role="prev-header"]');
   if (headerPrevEl) headerPrevEl.textContent = perf ? `PREV (${fmtDateShort(perf.date)})` : 'PREV';
-  block.querySelectorAll('[data-role="prev-val"]').forEach((el, si) => {
-    const s = perf && perf.sets[si];
-    el.textContent = s ? `${s.weight}×${s.reps}` : '—';
-  });
   paintCardioPrev(block, perf);
   updateBlockPrevNote(block, perf);
   setBlockPrevPerf(block, perf);
   updateBlockVsPrev(block, ex);
+  paintStrengthRows(block, ex);
+}
+
+/* Set numbers, drop styling, PREV cells and the expanded chains for one
+   strength block. Called when the block is built, when the past session it's
+   painted against changes (typing the name), and on a flag toggle — a toggle
+   renumbers every row below it, so their PREV cells move too. */
+function paintStrengthRows(block, ex) {
+  const rows = block.querySelectorAll('[data-role="set-row"]');
+  if (!rows.length) return;
+  const perf = blockPrevPerf.get(block);
+  const prevGroups = perf ? groupSets(perf.sets) : [];
+  const pos = setPositions(ex.sets);
+
+  rows.forEach((row, i) => {
+    if (!pos[i]) return;
+    const p = pos[i];
+    row.classList.toggle('is-drop', p.drop);
+    row.querySelector('[data-role="set-idx"]').textContent = p.drop ? '↳' : String(p.n);
+
+    const prevEl = row.querySelector('[data-role="prev-val"]');
+    const match = prevSegmentFor(prevGroups, p);
+    prevEl.innerHTML = match
+      ? `${escapeHtml(fmtSegment(match.seg))}${match.more ? '<span class="prev-more">+</span>' : ''}`
+      : '—';
+    prevEl.classList.toggle('has-more', !!(match && match.more));
+
+    const chain = row.nextElementSibling;
+    if (chain && chain.dataset.role === 'prev-chain') {
+      const open = !!(match && match.more) && row.dataset.expanded === '1';
+      chain.hidden = !open;
+      // The date is "Oct 17" in the DOM; the caps are CSS, as on .vs-label.
+      chain.innerHTML = open
+        ? `<span class="prev-chain-date">${escapeHtml(fmtDateShort(perf.date))}</span> set ${p.n}: ${escapeHtml(match.group.map(fmtSegment).join(' → '))}`
+        : '';
+    }
+  });
+  paintDropHints(block, ex);
+}
+
+// The keystroke half: only the hints, from adjacent rows. See dropHintRows.
+function paintDropHints(block, ex) {
+  const hints = block.querySelectorAll('[data-role="drop-hint"]');
+  if (!hints.length) return;
+  const perf = blockPrevPerf.get(block);
+  const show = dropHintRows(ex.sets, perf ? groupSets(perf.sets) : [], isInvertedExercise(ex));
+  hints.forEach((el, i) => {
+    const n = show[i] || 0;
+    el.hidden = !n;
+    el.textContent = n ? `↳ part of set ${n}?` : '';
+  });
 }
 
 function renderExerciseList() {
@@ -1404,9 +1619,12 @@ function normalizeExercise(ex) {
           inclinePct: s.inclinePct === '' || s.inclinePct == null ? 0 : Number(s.inclinePct) || 0,
         }))
         .filter(s => s.seconds > 0)
-    : (ex.sets || [])
-        .filter(s => s.weight !== '' && s.reps !== '' && !isNaN(Number(s.weight)) && !isNaN(Number(s.reps)))
-        .map(s => ({ weight: Number(s.weight), reps: Number(s.reps) }));
+    // compactSets, not a plain filter: a dropped incomplete row that started a
+    // set mustn't leave its tail flagged onto the set above.
+    : compactSets(ex.sets || [], s => s.weight !== '' && s.reps !== '' && !isNaN(Number(s.weight)) && !isNaN(Number(s.reps)))
+        .map(s => s.drop
+          ? { weight: Number(s.weight), reps: Number(s.reps), drop: true }
+          : { weight: Number(s.weight), reps: Number(s.reps) });
   return { name: (ex.name || '').trim(), kind, notes: (ex.notes || '').trim(), sets };
 }
 
@@ -1902,7 +2120,7 @@ function renderHistory() {
               : `${fmtNum(exerciseVolume(ex))} vol`;
           const detail = cardio
             ? escapeHtml(cardioSummary(ex.sets))
-            : ex.sets.map(s => `${s.weight}×${s.reps}`).join('  ·  ');
+            : groupSets(ex.sets).map(g => g.map(fmtSegment).join(' → ')).join('  ·  ');
           return `
           <div class="ex-row">
             <div class="ex-name"><span>${escapeHtml(displayExerciseName(ex))}${cardio ? '<span class="cardio-tag">CARDIO</span>' : ''}</span><span class="vol">${right}</span></div>
@@ -1983,7 +2201,7 @@ function renderSessionEditorCard(session) {
   // Any typing or removal marks the draft as changed, so leaving it can ask first.
   card.addEventListener('input', () => { editingDirty = true; });
   card.addEventListener('click', (e) => {
-    if (e.target.closest('[data-role="rm-ex"], [data-role="e-rm"]')) editingDirty = true;
+    if (e.target.closest('[data-role="rm-ex"], [data-role="e-rm"], .set-idx.tappable')) editingDirty = true;
   }, true);
 
   const head = document.createElement('div');
@@ -2021,9 +2239,11 @@ function renderSessionEditorCard(session) {
       wrap.appendChild(nameRow);
 
       const cardio = exerciseIsCardio(ex);
+      const labels = cardio ? null : setLabels(ex.sets);
       ex.sets.forEach((set, setIdx) => {
         const row = document.createElement('div');
-        row.className = 'edit-row';
+        const drop = !cardio && isDropRow(ex.sets, setIdx);
+        row.className = drop ? 'edit-row is-drop' : 'edit-row';
         row.innerHTML = cardio
           ? `
           <span class="set-idx">${setIdx + 1}</span>
@@ -2034,7 +2254,7 @@ function renderSessionEditorCard(session) {
           <button class="remove-set" data-role="e-rm" title="Remove">–</button>
         `
           : `
-          <span class="set-idx">${setIdx + 1}</span>
+          <span class="set-idx${setIdx > 0 ? ' tappable' : ''}" data-role="e-set-idx">${labels[setIdx]}</span>
           <input type="number" inputmode="decimal" step="any" min="0" value="${set.weight}" data-role="e-weight" placeholder="Weight">
           <input type="number" inputmode="numeric" step="1" min="0" value="${set.reps}" data-role="e-reps" placeholder="Reps">
           <button class="remove-set" data-role="e-rm" title="Remove set">–</button>
@@ -2050,9 +2270,16 @@ function renderSessionEditorCard(session) {
         } else {
           row.querySelector('[data-role="e-weight"]').addEventListener('input', (e) => { set.weight = e.target.value; });
           row.querySelector('[data-role="e-reps"]').addEventListener('input', (e) => { set.reps = e.target.value; });
+          if (setIdx > 0) {
+            row.querySelector('[data-role="e-set-idx"]').addEventListener('click', () => {
+              toggleDrop(ex.sets, setIdx);
+              paint();
+            });
+          }
         }
         row.querySelector('[data-role="e-rm"]').addEventListener('click', () => {
-          ex.sets.splice(setIdx, 1);
+          if (cardio) ex.sets.splice(setIdx, 1);
+          else ex.sets = removeSetAt(ex.sets, setIdx);
           if (ex.sets.length === 0) draft.exercises.splice(exIdx, 1);
           paint();
         });

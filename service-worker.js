@@ -11,7 +11,7 @@
 // concatenated so that grepping for `workout-tracker-v25`, or eyeballing this line on
 // the live Pages URL, still works — test-service-worker.js pins that they agree.
 const CACHE_PREFIX = 'workout-tracker-';
-const CACHE_NAME = 'workout-tracker-v28';
+const CACHE_NAME = 'workout-tracker-v29';
 const ASSETS = [
   './',
   './index.html',

@@ -710,6 +710,64 @@
     text-overflow:ellipsis;
   }
 
+  /* Drop sets: tap the set number to make a row continue the set above it.
+     The column stays 22px; the 44x44 hit area is an overlay grown mostly to the
+     left (into the card padding) so it barely reaches the PREV cell. Rows are
+     44px tall, so overlays on neighbouring rows never overlap. */
+  .set-idx.tappable{position:relative; cursor:pointer;}
+  .set-idx.tappable::before{
+    content:'';
+    position:absolute;
+    top:50%;
+    left:-14px;
+    right:-8px;
+    height:44px;
+    margin-top:-22px;
+  }
+  /* The negative margin pays for the border, so the inputs keep their width. */
+  .set-row.is-drop, .edit-row.is-drop{
+    border-left:2px solid var(--accent-dim);
+    margin-left:-6px;
+    padding-left:4px;
+  }
+  .set-row.is-drop .set-idx, .edit-row.is-drop .set-idx{color:var(--accent); font-size:14px;}
+  .prev-val .prev-more{color:var(--accent); font-weight:700;}
+  /* A cell with a "+" is the tap target for the full chain: whole row height. */
+  .set-row .prev-val.has-more{cursor:pointer; align-self:stretch; line-height:44px;}
+  .prev-chain{
+    margin:-4px 0 8px;
+    padding-left:30px;
+    font-size:12px;
+    color:var(--text-dim);
+    font-variant-numeric:tabular-nums;
+    overflow-wrap:anywhere;
+  }
+  .prev-chain[hidden]{display:none;}
+  .prev-chain .prev-chain-date{
+    font-size:10px;
+    font-weight:700;
+    letter-spacing:0.03em;
+    text-transform:uppercase;
+    color:var(--accent);
+  }
+  /* "↳ part of set N?" — offered, never assumed. Full-width and 44px tall to tap;
+     the negative top margin eats the gap under the row it belongs to. */
+  .drop-hint{
+    display:block;
+    width:100%;
+    min-height:44px;
+    margin:-8px 0 0;
+    padding:0 0 0 30px;
+    background:none;
+    border:none;
+    text-align:left;
+    font-family:inherit;
+    font-size:12px;
+    color:var(--text-dim);
+    cursor:pointer;
+  }
+  .drop-hint[hidden]{display:none;}
+
   /* Notes */
   .notes-row{margin-top:6px;}
   .notes-row input{font-size:14px;}
