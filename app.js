@@ -2660,6 +2660,14 @@ function buildSyncPayload() {
               // invertedTrueLoad() — an assist heavier than you is a typo.
               bodyWeightUsed: inverted && bw ? bw.weight : '',
               trueLoad: inverted && bw ? Math.max(0, bw.weight - weight) * reps : '',
+              // Workouts column L (v30). Sent on EVERY strength row, not just
+              // the flagged ones, so the column is uniformly authoritative and
+              // the script never has to guess what a blank means.
+              //
+              // A real boolean, never the string 'TRUE' — a text cell renders
+              // identically and quietly fails COUNTIF(L:L, TRUE). `drop` is
+              // absent rather than false on an unflagged set, hence the coerce.
+              drop: !!set.drop,
               notes: ex.notes || '',
             });
           }
